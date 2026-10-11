@@ -9,7 +9,7 @@ import io
 import posixpath
 import re
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from xml.etree import ElementTree as ET
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -34,12 +34,17 @@ PART = re.compile(
     r"theme/theme[0-9]+\.xml|worksheets/sheet[0-9]+\.xml))\Z"
 )
 SHEET_TAGS = set(
-    "worksheet sheetPr outlinePr pageSetUpPr dimension sheetViews sheetView selection "
+    "worksheet sheetPr outlinePr pageSetUpPr dimension sheetViews sheetView pane selection "
     "sheetFormatPr cols col sheetData row c v f is t pageMargins".split()
 )
 BOOK_TAGS = set(
     "workbook fileVersion workbookPr bookViews workbookView sheets sheet "
     "definedNames calcPr workbookProtection".split()
+)
+FEATURE_BAG_ERROR = (
+    "Неподдерживаемая часть XLSX: featurePropertyBag. Она может содержать свойства "
+    "элементов управления и ссылки из стилей. Проверка этих связей пока не реализована; "
+    "безопасность очистки не гарантируется. Исходный файл не изменён."
 )
 
 
@@ -74,7 +79,158 @@ def _check_tags(root: ET.Element, allowed: set[str]) -> None:
                 raise CleaningError("Расширенные атрибуты XLSX не поддерживаются.")
 
 
-def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool]:
+def _view_error(detail: str) -> CleaningError:
+    return CleaningError(f"Неподдерживаемая структура XLSX: pane/sheetViews — {detail}.")
+
+
+def _view_cell(reference: str) -> tuple[int, int]:
+    if not re.fullmatch(r"\$?[A-Z]{1,3}\$?[1-9][0-9]{0,6}", reference):
+        raise _view_error(f"некорректная координата {reference!r}")
+    row, column = coordinate_to_tuple(reference.replace("$", ""))
+    if row > 1048576 or column > 16384:
+        raise _view_error("координата вне границ листа")
+    return row, column
+
+
+def _split_count(pane: ET.Element, name: str, limit: int) -> int:
+    try:
+        value = Decimal(pane.get(name, "0"))
+    except InvalidOperation as exc:
+        raise _view_error(f"неверное значение {name}") from exc
+    if not value.is_finite() or not 0 <= value < limit or value != int(value):
+        raise _view_error(f"{name} должен задавать целое число закреплённых строк/столбцов")
+    return int(value)
+
+
+def _check_sheet_views(root: ET.Element) -> ET.Element | None:
+    views = root.findall("s:sheetViews", NS)
+    # The allowlist alone does not enforce nesting or cardinality.
+    for tag, path in (
+        ("sheetViews", "s:sheetViews"),
+        ("sheetView", "s:sheetViews/s:sheetView"),
+        ("pane", "s:sheetViews/s:sheetView/s:pane"),
+        ("selection", "s:sheetViews/s:sheetView/s:selection"),
+    ):
+        if len(list(root.iter(f"{{{MAIN}}}{tag}"))) != len(root.findall(path, NS)):
+            raise _view_error(f"неверное расположение {tag}")
+    if len(views) > 1:
+        raise _view_error("несколько sheetViews")
+    if not views:
+        return None
+    views = views[0]
+    if views.attrib or not len(views):
+        raise _view_error("неверный sheetViews")
+    for view in views:
+        if view.tag != f"{{{MAIN}}}sheetView":
+            raise _view_error("ожидается sheetView")
+        panes = view.findall("s:pane", NS)
+        selections = view.findall("s:selection", NS)
+        if len(panes) > 1 or len(selections) > 4 or len(view) != len(panes) + len(selections):
+            raise _view_error("неверный состав sheetView")
+        if "topLeftCell" in view.attrib:
+            _view_cell(view.attrib["topLeftCell"])
+        available = {"topLeft"}
+        if panes:
+            pane = panes[0]
+            if (
+                view[0] is not pane
+                or len(pane)
+                or set(pane.attrib) - {"xSplit", "ySplit", "topLeftCell", "activePane", "state"}
+            ):
+                raise _view_error("неизвестные свойства или расположение pane")
+            if pane.get("state") != "frozen":
+                raise _view_error("поддерживается только state=frozen; split/frozenSplit запрещены")
+            if (
+                view.get("rightToLeft", "0") not in {"0", "false"}
+                or view.get("view", "normal") != "normal"
+            ):
+                raise _view_error("закрепление поддерживается в обычном виде слева направо")
+            x = _split_count(pane, "xSplit", 16384)
+            y = _split_count(pane, "ySplit", 1048576)
+            row, column = _view_cell(pane.get("topLeftCell", ""))
+            if not (x or y) or row <= y or column <= x:
+                raise _view_error("topLeftCell не согласован с границей закрепления")
+            if x:
+                available.add("topRight")
+            if y:
+                available.add("bottomLeft")
+            if x and y:
+                available.add("bottomRight")
+            if pane.get("activePane", "topLeft") not in available:
+                raise _view_error("activePane не соответствует закреплению")
+        for selection in selections:
+            if len(selection) or set(selection.attrib) - {
+                "pane",
+                "activeCell",
+                "activeCellId",
+                "sqref",
+            }:
+                raise _view_error("неизвестные свойства selection")
+            if selection.get("pane", "topLeft") not in available:
+                raise _view_error("selection ссылается на отсутствующую область")
+            if "activeCell" in selection.attrib:
+                _view_cell(selection.attrib["activeCell"])
+            ranges = selection.get("sqref", "A1").split()
+            if not ranges:
+                raise _view_error("пустой sqref")
+            for reference in ranges:
+                ends = reference.split(":")
+                if len(ends) > 2:
+                    raise _view_error("неверный диапазон selection")
+                start, end = _view_cell(ends[0]), _view_cell(ends[-1])
+                if start[0] > end[0] or start[1] > end[1]:
+                    raise _view_error("обратный диапазон selection")
+            if not 0 <= int(selection.get("activeCellId", "0")) < len(ranges):
+                raise _view_error("activeCellId вне списка диапазонов")
+    return views
+
+
+def _remap_sheet_views(views: ET.Element | None, removed: list[int]) -> None:
+    """Keep freeze geometry; shift surviving view references with their source rows.
+
+    A deleted anchor or any deletion inside a selection is deliberately rejected:
+    choosing a replacement active cell/range would change the user's view semantics.
+    """
+    if views is None or not removed:
+        return
+
+    def shift(reference: str) -> str:
+        row, _ = _view_cell(reference)
+        offset = bisect.bisect_left(removed, row)
+        if offset < len(removed) and removed[offset] == row:
+            raise CleaningError(
+                "Удаление строк заблокировано: удаляется координата прокрутки/выделения "
+                "sheetViews. Переместите выделение/прокрутку в Excel или отключите удаление строк."
+            )
+        return re.sub(r"[0-9]+$", str(row - offset), reference)
+
+    for view in views:
+        pane = view.find("s:pane", NS)
+        if pane is not None and removed[0] <= _split_count(pane, "ySplit", 1048576):
+            raise CleaningError(
+                "Удаление строк заблокировано: строка входит в закреплённую область pane. "
+                "Отключите удаление строк или измените закрепление в Excel."
+            )
+        for node in view.iter():
+            for attribute in ("topLeftCell", "activeCell"):
+                if attribute in node.attrib:
+                    node.set(attribute, shift(node.attrib[attribute]))
+            if "sqref" in node.attrib:
+                references = []
+                for reference in node.attrib["sqref"].split():
+                    ends = reference.split(":")
+                    first, last = _view_cell(ends[0])[0], _view_cell(ends[-1])[0]
+                    if bisect.bisect_right(removed, last) != bisect.bisect_left(removed, first):
+                        raise CleaningError(
+                            "Удаление строк заблокировано: затронут диапазон выделения "
+                            "selection/sqref. Измените выделение в Excel "
+                            "или отключите удаление строк."
+                        )
+                    references.append(":".join(shift(end) for end in ends))
+                node.set("sqref", " ".join(references))
+
+
+def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool, dict[str, bytes]]:
     with ZipFile(io.BytesIO(snapshot)) as archive:
         infos = archive.infolist()
         names = [item.filename for item in infos]
@@ -83,6 +239,8 @@ def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool]:
         if sum(item.file_size for item in infos) > MAX_EXPANDED_BYTES:
             raise CleaningError("Распакованная книга превышает лимит 256 MiB.")
         for name in names:
+            if name.startswith("xl/featurePropertyBag/"):
+                raise CleaningError(FEATURE_BAG_ERROR)
             if not PART.fullmatch(name):
                 raise CleaningError(f"Неподдерживаемая часть XLSX: {name}.")
         roots = {name: parse_xml(archive.read(name)) for name in names}
@@ -92,6 +250,8 @@ def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool]:
                     if relation.get("TargetMode") == "External":
                         raise CleaningError("Внешние ссылки XLSX не поддерживаются.")
                     kind = relation.get("Type", "").rsplit("/", 1)[-1]
+                    if kind == "FeaturePropertyBag":
+                        raise CleaningError(FEATURE_BAG_ERROR)
                     if kind not in {
                         "officeDocument",
                         "core-properties",
@@ -126,9 +286,13 @@ def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool]:
                 raise CleaningError("Повторяющиеся листы XLSX не поддерживаются.")
             sheets[node.attrib["name"]] = part
         formulas = False
+        sheet_views = {}
         for part in sheets.values():
             root = roots[part]
             _check_tags(root, SHEET_TAGS)
+            views = _check_sheet_views(root)
+            if views is not None:
+                sheet_views[part] = ET.tostring(views, encoding="utf-8")
             if root.tag != f"{{{MAIN}}}worksheet" or len(root.findall("s:sheetData", NS)) != 1:
                 raise CleaningError("Некорректная структура листа XLSX.")
             if any(int(node.get("outlineLevel", "0")) for node in root.iter()):
@@ -154,7 +318,7 @@ def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool]:
                                 "Общие, массивные и табличные формулы не поддерживаются."
                             )
                         formulas = True
-        return sheets, formulas
+        return sheets, formulas, sheet_views
 
 
 def read_table(snapshot: bytes, selected: str, part: str) -> Table:
@@ -221,6 +385,9 @@ def validate_result(source: CleaningSource, result: CleaningResult) -> None:
         raise CleaningError(
             "Удаление строк заблокировано: в книге есть формулы, включая другие листы."
         )
+    if source.xlsx_sheet_views is not None and len(rows) != len(source.table.rows):
+        removed = sorted(set(range(1, len(source.table.rows) + 1)) - set(rows))
+        _remap_sheet_views(parse_xml(source.xlsx_sheet_views), removed)
     for index, row in zip(rows, result.table.rows, strict=True):
         original = source.table.rows[index - 1]
         if len(original) != len(row):
@@ -248,6 +415,7 @@ def write_xlsx(source: CleaningSource, result: CleaningResult, stream) -> None:
         modified_xml = None
         if removed or changed:
             root = parse_xml(archive.read(source.sheet_part))
+            _remap_sheet_views(root.find("s:sheetViews", NS), removed)
             data = root.find("s:sheetData", NS)
             removed_set = set(removed)
             retained = []

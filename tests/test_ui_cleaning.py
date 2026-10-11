@@ -337,6 +337,72 @@ def test_safety_refusal_retains_original_and_disables_export(app, window, tmp_pa
         assert "кэш" in window.report_details.toPlainText()
 
 
+@pytest.mark.parametrize("freeze", ["A2", "B1", "C2"])
+def test_gui_freeze_analysis_and_export(app, window, tmp_path, freeze):
+    path = tmp_path / "frozen.xlsx"
+    book = Workbook()
+    book.active.append(["ID"])
+    book.active.append([" 001 "])
+    book.active.append(["001"])
+    book.active.freeze_panes = freeze
+    book.save(path)
+    book.close()
+    load(app, window, path)
+    analyze(app, window)
+    assert window.errors.toPlainText() == ""
+    assert window.save_button.isEnabled()
+    output = tmp_path / "out.xlsx"
+    window.save_cleaned_file(output)
+    wait_until(app, lambda: window._worker is None)
+    assert window.saved_label.text()
+    book = load_workbook(output)
+    try:
+        assert book.active.freeze_panes == freeze
+        assert book.active["A2"].value == "001"
+        assert book.active.max_row == 2
+    finally:
+        book.close()
+
+
+@pytest.mark.parametrize("unsafe", ["frozen_row", "split", "feature_bag"])
+def test_gui_compatibility_refusal_is_visible_and_cannot_export(
+    app, window, tmp_path, feature_bag_xlsx, unsafe
+):
+    path = feature_bag_xlsx
+    expected = "featurePropertyBag"
+    if unsafe != "feature_bag":
+        path = tmp_path / "unsafe-pane.xlsx"
+        book = Workbook()
+        book.active.append(["ID"])
+        book.active.append([" 001 "])
+        book.active.append(["001"])
+        book.active.freeze_panes = "A4"
+        if unsafe == "split":
+            book.active.sheet_view.pane.state = "split"
+        expected = "закреплённую область" if unsafe == "frozen_row" else "state=frozen"
+        book.save(path)
+        book.close()
+    before = path.read_bytes(), path.stat().st_mtime_ns
+    load(app, window, path)
+    original_rows = window.model.rowCount()
+    analyze(app, window)
+    assert expected in window.errors.toPlainText()
+    assert window.errors.isVisible()
+    assert window.model.rowCount() == original_rows
+    assert window._job is None
+    assert not window.save_button.isEnabled()
+    assert not window.saved_label.text()
+    output = tmp_path / "out.xlsx"
+    window.save_cleaned_file(output)
+    assert not output.exists()
+    assert before == (path.read_bytes(), path.stat().st_mtime_ns)
+    if unsafe == "frozen_row":
+        window.operation_checks["remove_duplicates"].setChecked(False)
+        analyze(app, window)
+        assert window.errors.toPlainText() == ""
+        assert window.save_button.isEnabled()
+
+
 def test_export_failure_clears_success_and_allows_retry(app, window, source_csv, tmp_path):
     load(app, window, source_csv)
     analyze(app, window)

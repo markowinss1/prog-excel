@@ -19,6 +19,8 @@ class CleaningSource:
     xlsx_snapshot: bytes | None = field(default=None, repr=False)
     sheet_part: str | None = None
     contains_formulas: bool = False
+    # Small, validated view subtree; avoids reparsing worksheet data during validation.
+    xlsx_sheet_views: bytes | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)

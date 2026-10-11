@@ -51,7 +51,7 @@ class FileCleaningStorage:
                     snapshot = stream.read(MAX_ARCHIVE_BYTES + 1)
                 if len(snapshot) > MAX_ARCHIVE_BYTES:
                     raise CleaningError("XLSX превышает лимит 128 MiB.")
-                sheets, formulas = inspect_archive(snapshot)
+                sheets, formulas, views = inspect_archive(snapshot)
                 if not sheets:
                     raise CleaningError("В книге нет листов.")
                 selected = sheet if sheet is not None else next(iter(sheets))
@@ -66,6 +66,7 @@ class FileCleaningStorage:
                     xlsx_snapshot=snapshot,
                     sheet_part=sheets[selected],
                     contains_formulas=formulas,
+                    xlsx_sheet_views=views.get(sheets[selected]),
                 )
             if path.suffix.lower() != ".csv":
                 raise CleaningError("Cleaner поддерживает только .xlsx и .csv.")

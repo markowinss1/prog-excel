@@ -176,7 +176,7 @@ def test_formulas_and_formula_like_text_are_preserved(cleaner, tmp_path):
         "table",
         "name",
         "filter",
-        "freeze",
+        "split",
         "validation",
         "comment",
         "hyperlink",
@@ -203,8 +203,9 @@ def test_unsafe_workbooks_rejected_even_on_unselected_sheet(cleaner, tmp_path, s
         book.defined_names.add(DefinedName("TestName", attr_text="Complex!$A$1"))
     elif structure == "filter":
         sheet.auto_filter.ref = "A1:B2"
-    elif structure == "freeze":
+    elif structure == "split":
         sheet.freeze_panes = "A2"
+        sheet.sheet_view.pane.state = "split"
     elif structure == "validation":
         sheet.add_data_validation(DataValidation(type="whole", formula1=0, formula2=10))
     elif structure == "comment":

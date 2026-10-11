@@ -46,6 +46,12 @@ FEATURE_BAG_ERROR = (
     "элементов управления и ссылки из стилей. Проверка этих связей пока не реализована; "
     "безопасность очистки не гарантируется. Исходный файл не изменён."
 )
+FEATURE_BAG_NS = "http://schemas.microsoft.com/office/spreadsheetml/2022/featurepropertybag"
+FEATURE_BAG_CONTENT_TYPE = "application/vnd.ms-excel.featurepropertybag+xml"
+FEATURE_BAG_STYLE_URIS = {
+    "{C7286773-470A-42A8-94C5-96B5CB345126}",  # xfComplement
+    "{0417FA29-78FA-4A13-93AC-8FF0FAFDF519}",  # DXFComplement
+}
 
 
 def parse_xml(data: bytes) -> ET.Element:
@@ -77,6 +83,27 @@ def _check_tags(root: ET.Element, allowed: set[str]) -> None:
                 f"{{{DOC_REL}}}id",
             }:
                 raise CleaningError("Расширенные атрибуты XLSX не поддерживаются.")
+
+
+def _check_style_extensions(styles: ET.Element) -> None:
+    """Do not silently accept implicit bag references when its part/rels are absent.
+
+    Styles are copied verbatim, but extensions can change what an empty cell means
+    (e.g. a checkbox with a default state). Copying bytes alone cannot make row
+    deletion safe. Ordinary SpreadsheetML formatting remains supported.
+    """
+    for node in styles.iter():
+        if node.tag.startswith(f"{{{FEATURE_BAG_NS}}}") or node.get("uri", "").upper() in (
+            FEATURE_BAG_STYLE_URIS
+        ):
+            raise CleaningError(FEATURE_BAG_ERROR)
+    for node in styles.iter():
+        if (
+            not node.tag.startswith(f"{{{MAIN}}}")
+            or node.tag in {f"{{{MAIN}}}ext", f"{{{MAIN}}}extLst"}
+            or any(key.startswith("{") for key in node.attrib)
+        ):
+            raise CleaningError("Неподдерживаемые расширения стилей XLSX.")
 
 
 def _view_error(detail: str) -> CleaningError:
@@ -244,6 +271,9 @@ def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool, dict[str, by
             if not PART.fullmatch(name):
                 raise CleaningError(f"Неподдерживаемая часть XLSX: {name}.")
         roots = {name: parse_xml(archive.read(name)) for name in names}
+        for declaration in roots["[Content_Types].xml"]:
+            if declaration.get("ContentType") == FEATURE_BAG_CONTENT_TYPE:
+                raise CleaningError(FEATURE_BAG_ERROR)
         for name, root in roots.items():
             if name.endswith(".rels"):
                 for relation in root:
@@ -262,6 +292,9 @@ def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool, dict[str, by
                         "sharedStrings",
                     }:
                         raise CleaningError(f"Неподдерживаемая связь XLSX: {kind}.")
+        styles = roots.get("xl/styles.xml")
+        if styles is not None:
+            _check_style_extensions(styles)
         book = roots["xl/workbook.xml"]
         _check_tags(book, BOOK_TAGS)  # Nonempty definedNames introduces forbidden definedName.
         protection = book.find("s:workbookProtection", NS)
@@ -321,8 +354,13 @@ def inspect_archive(snapshot: bytes) -> tuple[dict[str, str], bool, dict[str, by
         return sheets, formulas, sheet_views
 
 
-def read_table(snapshot: bytes, selected: str, part: str) -> Table:
-    # Actual values define the finite rectangle; remote formatting is not missing data.
+def read_table(snapshot: bytes, selected: str, part: str) -> tuple[Table, int]:
+    """Return the logical rectangle and count of physical rows beyond it.
+
+    A stored v/is/f payload anchors the rectangle, even if its value is blank.
+    Bare rows/cells, styles and dimension metadata alone do not extend it.
+    Rows outside this rectangle are preserved, not reported as removed.
+    """
     with ZipFile(io.BytesIO(snapshot)) as archive:
         root = parse_xml(archive.read(part))
     last_row = last_column = 0
@@ -336,8 +374,11 @@ def read_table(snapshot: bytes, selected: str, part: str) -> Table:
             last_row, last_column = max(last_row, r), max(last_column, c)
     if last_row * last_column > MAX_CELLS:
         raise CleaningError("Область данных XLSX превышает лимит 2 000 000 ячеек.")
+    trailing_rows = sum(
+        int(row.attrib["r"]) > last_row for row in root.findall("s:sheetData/s:row", NS)
+    )
     if not last_row:
-        return Table(())
+        return Table(()), trailing_rows
     with io.BytesIO(snapshot) as stream:
         book = load_workbook(stream, read_only=True, data_only=False, keep_links=False)
         try:
@@ -370,7 +411,7 @@ def read_table(snapshot: bytes, selected: str, part: str) -> Table:
                 "безопасное сравнение не гарантируется."
             )
         decoded_numbers[key] = raw
-    return table
+    return table, trailing_rows
 
 
 def validate_result(source: CleaningSource, result: CleaningResult) -> None:

@@ -374,3 +374,144 @@ def test_xlsx_failed_publication_leaves_no_partial_file(cleaner, tmp_path, monke
     assert not output.exists()
     assert not list(tmp_path.glob(".cleaner-*"))
     assert fingerprint(path) == before
+
+
+def remove_feature_package_declarations(parts):
+    """Simulate incomplete producers while retaining the real style-side reference."""
+    parts.pop("xl/featurePropertyBag/featurePropertyBag.xml")
+    for name, attribute, value in (
+        ("xl/_rels/workbook.xml.rels", "Id", "rIdFeatureBag"),
+        (
+            "[Content_Types].xml",
+            "ContentType",
+            "application/vnd.ms-excel.featurepropertybag+xml",
+        ),
+    ):
+        root = ET.fromstring(parts[name])
+        for node in list(root):
+            if node.get(attribute) == value:
+                root.remove(node)
+        parts[name] = ET.tostring(root)
+
+
+@pytest.mark.parametrize("reference", ["xf", "dxf", "uri", "content_type", "unknown"])
+def test_orphan_bag_metadata_cannot_bypass_refusal(cleaner, feature_bag_xlsx, reference):
+    def change(parts):
+        content_types = parts["[Content_Types].xml"]
+        remove_feature_package_declarations(parts)
+        styles = ET.fromstring(parts["xl/styles.xml"])
+        extension = styles.find("s:cellXfs/s:xf/s:extLst/s:ext", NS)
+        if reference == "xf":
+            extension.set("uri", "{UNKNOWN}")  # Namespace detection is independent of URI.
+        elif reference == "dxf":
+            complement = extension[0]
+            complement.tag = complement.tag.replace("xfComplement", "DXFComplement")
+            extension.set("uri", "{0417FA29-78FA-4A13-93AC-8FF0FAFDF519}")
+            xf = styles.find("s:cellXfs", NS)[1]
+            ext_list = xf.find("s:extLst", NS)
+            xf.remove(ext_list)
+            main = NS["s"]
+            dxfs = ET.SubElement(styles, f"{{{main}}}dxfs", count="1")
+            ET.SubElement(dxfs, f"{{{main}}}dxf").append(ext_list)
+        elif reference == "uri":
+            extension.remove(extension[0])
+        elif reference == "content_type":
+            parts["[Content_Types].xml"] = content_types
+            xf = styles.find("s:cellXfs", NS)[1]
+            xf.remove(xf.find("s:extLst", NS))
+        elif reference == "unknown":
+            extension.set("uri", "{UNKNOWN}")
+            extension[0].tag = "{urn:unknown}UnknownFeature"
+        parts["xl/styles.xml"] = ET.tostring(styles)
+
+    rewrite(feature_bag_xlsx, change)
+    before = fingerprint(feature_bag_xlsx)
+    error = "расширения стилей" if reference == "unknown" else "featurePropertyBag"
+    with pytest.raises(CleaningError, match=error):
+        cleaner.analyze(feature_bag_xlsx, CleaningPlan(True, True, True, True))
+    assert fingerprint(feature_bag_xlsx) == before
+
+
+@pytest.mark.parametrize("kind", ["rel", "bag_extension", "default", "unknown_attribute"])
+def test_additional_feature_bag_semantics_are_rejected(cleaner, feature_bag_xlsx, kind):
+    def change(parts):
+        name = "xl/featurePropertyBag/featurePropertyBag.xml"
+        root = ET.fromstring(parts[name])
+        namespace = root.tag.split("}")[0] + "}"
+        checkbox = root[0]
+        if kind == "rel":
+            ET.SubElement(checkbox, namespace + "rel", k="UnknownLink").text = "rIdMissing"
+        elif kind == "bag_extension":
+            root.insert(0, ET.Element(namespace + "bagExt"))
+            checkbox.set("bagExtId", "0")
+        elif kind == "default":
+            ET.SubElement(checkbox, namespace + "i", k="default").text = "2"
+            sheet = ET.fromstring(parts["xl/worksheets/sheet1.xml"])
+            cell = sheet.find('s:sheetData/s:row/s:c[@r="A2"]', NS)
+            cell.remove(cell.find("s:v", NS))
+            cell.attrib.pop("t")  # Empty value does not imply absence of a control.
+            parts["xl/worksheets/sheet1.xml"] = ET.tostring(sheet)
+        else:
+            checkbox.set("unknown", "1")
+        parts[name] = ET.tostring(root)
+
+    rewrite(feature_bag_xlsx, change)
+    before = fingerprint(feature_bag_xlsx)
+    with pytest.raises(CleaningError, match="featurePropertyBag"):
+        cleaner.analyze(feature_bag_xlsx, CleaningPlan(remove_empty_rows=True))
+    assert fingerprint(feature_bag_xlsx) == before
+
+
+def test_openpyxl_read_save_loses_real_feature_metadata(feature_bag_xlsx, tmp_path):
+    """Diagnostic regression: value readability is not evidence of safe export."""
+    before = fingerprint(feature_bag_xlsx)
+    bag_part = "xl/featurePropertyBag/featurePropertyBag.xml"
+    namespace = "http://schemas.microsoft.com/office/spreadsheetml/2022/featurepropertybag"
+    with ZipFile(feature_bag_xlsx) as original:
+        bag = ET.fromstring(original.read(bag_part))
+        assert [node.get("type") for node in bag] == [
+            "Checkbox",
+            "XFControls",
+            "XFComplement",
+            "XFComplements",
+        ]
+        styles = ET.fromstring(original.read("xl/styles.xml"))
+        assert styles.find(f".//{{{namespace}}}xfComplement").get("i") == "0"
+        for name in ("[Content_Types].xml", "xl/_rels/workbook.xml.rels"):
+            assert b"featurepropertybag" in original.read(name).lower()
+    # Both reading modes expose the boolean but not the control's semantics.
+    for read_only in (True, False):
+        book = load_workbook(feature_bag_xlsx, read_only=read_only)
+        try:
+            assert book.active["A2"].value is True
+            assert book.active["A2"].data_type == "b"
+            if not read_only:
+                book.save(tmp_path / "openpyxl-resaved.xlsx")
+        finally:
+            book.close()
+    with ZipFile(tmp_path / "openpyxl-resaved.xlsx") as saved:
+        assert saved.testzip() is None
+        assert bag_part not in saved.namelist()
+        for name in ("[Content_Types].xml", "xl/_rels/workbook.xml.rels", "xl/styles.xml"):
+            assert b"featurepropertybag" not in saved.read(name).lower()
+        assert b"xfComplement" not in saved.read("xl/styles.xml")
+    assert fingerprint(feature_bag_xlsx) == before
+
+
+def test_empty_unreferenced_bag_is_not_implicitly_allowed(cleaner, feature_bag_xlsx):
+    def change(parts):
+        name = "xl/featurePropertyBag/featurePropertyBag.xml"
+        root = ET.fromstring(parts[name])
+        root.clear()
+        root.set("count", "0")
+        parts[name] = ET.tostring(root)
+        styles = ET.fromstring(parts["xl/styles.xml"])
+        xf = styles.find("s:cellXfs", NS)[1]
+        xf.remove(xf.find("s:extLst", NS))
+        parts["xl/styles.xml"] = ET.tostring(styles)
+
+    rewrite(feature_bag_xlsx, change)
+    before = fingerprint(feature_bag_xlsx)
+    with pytest.raises(CleaningError, match="featurePropertyBag"):
+        cleaner.analyze(feature_bag_xlsx, CleaningPlan())
+    assert fingerprint(feature_bag_xlsx) == before

@@ -21,6 +21,8 @@ class CleaningSource:
     contains_formulas: bool = False
     # Small, validated view subtree; avoids reparsing worksheet data during validation.
     xlsx_sheet_views: bytes | None = field(default=None, repr=False)
+    # Physical XML rows after the logical table, not part of Cleaner row counts.
+    xlsx_trailing_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,20 @@ class CleaningService:
         source = self._storage.read(Path(path), sheet, csv_options or CsvOptions())
         result = clean(source.table, plan)
         self._storage.validate(source, result)
+        if source.xlsx_trailing_rows:
+            result = replace(
+                result,
+                report=replace(
+                    result.report,
+                    warnings=result.report.warnings
+                    + (
+                        f"За логическим диапазоном XLSX находятся пустые XML-строки: "
+                        f"{source.xlsx_trailing_rows}. Они не входят в счётчики отчёта и "
+                        "сохраняются при экспорте вместе с оформлением. Remove Empty Rows "
+                        "удаляет пустые строки только внутри логической таблицы.",
+                    ),
+                ),
+            )
         if source.contains_formulas:
             result = replace(
                 result,

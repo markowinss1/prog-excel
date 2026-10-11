@@ -57,7 +57,7 @@ class FileCleaningStorage:
                 selected = sheet if sheet is not None else next(iter(sheets))
                 if selected not in sheets:
                     raise CleaningError(f"Лист «{selected}» не найден.")
-                table = read_table(snapshot, selected, sheets[selected])
+                table, trailing_rows = read_table(snapshot, selected, sheets[selected])
                 return CleaningSource(
                     path,
                     table,
@@ -67,6 +67,7 @@ class FileCleaningStorage:
                     sheet_part=sheets[selected],
                     contains_formulas=formulas,
                     xlsx_sheet_views=views.get(sheets[selected]),
+                    xlsx_trailing_rows=trailing_rows,
                 )
             if path.suffix.lower() != ".csv":
                 raise CleaningError("Cleaner поддерживает только .xlsx и .csv.")

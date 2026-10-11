@@ -36,6 +36,9 @@ class CleaningPlan:
     has_header: bool = True
     duplicate_columns: tuple[int, ...] | None = None  # Zero-based indexes.
     missing_detail_limit: int = 1000
+    duplicate_detail_limit: int = 100
+    duplicate_row_detail_limit: int = 20
+    issue_detail_limit: int = 100
 
     def __post_init__(self) -> None:
         if any(
@@ -49,8 +52,14 @@ class CleaningPlan:
             )
         ):
             raise CleaningError("Флаги операций и has_header должны быть bool.")
-        if type(self.missing_detail_limit) is not int or self.missing_detail_limit < 0:
-            raise CleaningError("Лимит подробностей должен быть целым неотрицательным числом.")
+        for limit in (
+            self.missing_detail_limit,
+            self.duplicate_detail_limit,
+            self.duplicate_row_detail_limit,
+            self.issue_detail_limit,
+        ):
+            if type(limit) is not int or limit < 0:
+                raise CleaningError("Лимит подробностей должен быть целым неотрицательным числом.")
         if self.duplicate_columns is not None:
             columns = tuple(self.duplicate_columns)
             if not columns or any(type(c) is not int or c < 0 for c in columns):
@@ -68,6 +77,24 @@ class MissingValue:
 
 
 @dataclass(frozen=True)
+class DataIssue:
+    source_row: int  # One-based coordinate before cleaning.
+    column: int  # One-based column coordinate.
+    kind: str  # "Missing Key" or "Missing Value".
+
+
+@dataclass(frozen=True)
+class DuplicateGroup:
+    key: tuple[Cell, ...]
+    kept_source_row: int
+    kept_values: tuple[Cell, ...]
+    removed_source_rows: tuple[int, ...]
+    removed_values: tuple[tuple[Cell, ...], ...]
+    removed_count: int  # Full count, including removed rows beyond the sample limit.
+    conflicting_columns: tuple[int, ...]  # Zero-based indexes, including unsampled rows.
+
+
+@dataclass(frozen=True)
 class CleaningReport:
     original_rows: int
     final_rows: int
@@ -79,6 +106,14 @@ class CleaningReport:
     missing_details_truncated: bool = False
     warnings: tuple[str, ...] = ()
     performed_operations: tuple[str, ...] = ()
+    duplicate_columns: tuple[int, ...] = ()
+    duplicate_groups: tuple[DuplicateGroup, ...] = ()
+    duplicate_group_count: int = 0
+    conflicting_duplicate_groups: int = 0
+    missing_key_rows: int = 0
+    issues: tuple[DataIssue, ...] = ()
+    issue_count: int = 0
+    issues_truncated: bool = False
 
 
 @dataclass(frozen=True)

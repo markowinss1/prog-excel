@@ -4,7 +4,7 @@ from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Slot
+from PySide6.QtCore import QAbstractTableModel, QSignalBlocker, Qt, QTimer, Slot
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -15,8 +15,10 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListView,
     QListWidget,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -28,10 +30,14 @@ from PySide6.QtWidgets import (
 )
 
 from excel_toolkit.application.cleaning import CleaningJob, CleaningService
-from excel_toolkit.application.models import CsvOptions, Preview
+from excel_toolkit.application.models import Cell, CsvOptions, Preview
 from excel_toolkit.application.preview import PreviewService
-from excel_toolkit.modules.cleaner import CleaningPlan
-from excel_toolkit.ui.table_model import PreviewTableModel
+from excel_toolkit.modules.cleaner import CleaningError, CleaningPlan, CleaningReport
+from excel_toolkit.ui.table_model import (
+    ColumnSelectionModel,
+    IssuesTableModel,
+    PreviewTableModel,
+)
 from excel_toolkit.ui.worker import PreviewWorker, ServiceWorker, analyze_for_display, export_file
 
 OPERATIONS = (
@@ -48,6 +54,11 @@ SUMMARY_FIELDS = (
     ("changed_text_cells", "Trimmed Cells"),
     ("missing_values", "Missing Values"),
 )
+ISSUE_DISPLAY_LIMIT = 100
+DUPLICATE_DISPLAY_LIMIT = 100
+REMOVED_SAMPLE_LIMIT = 20
+DETAIL_COLUMN_LIMIT = 12
+DETAIL_TEXT_LIMIT = 300_000
 
 
 class MainWindow(QMainWindow):
@@ -64,6 +75,7 @@ class MainWindow(QMainWindow):
         self._revision = 0
         self._worker_revision = 0
         self._closing = False
+        self._confirming_export = False
         self.setWindowTitle("Excel Freelancer Toolkit")
         self.resize(1100, 900)
         self.setMinimumSize(760, 540)
@@ -113,7 +125,24 @@ class MainWindow(QMainWindow):
         self.preview_tabs = QTabWidget()
         self.preview_tabs.addTab(self.table, "Original Data")
         self.preview_tabs.addTab(self.cleaned_table, "Cleaned Data")
+        self.issues_model = IssuesTableModel(self.column_model)
+        self.issues_table = self._table_view(self.issues_model)
+        self.issues_table.setColumnWidth(0, 110)
+        self.issues_table.setColumnWidth(1, 260)
+        issues_page = QWidget()
+        issues_layout = QVBoxLayout(issues_page)
+        self.issues_label = QLabel("Выполните анализ для просмотра проблем.")
+        self.issues_label.setWordWrap(True)
+        issues_layout.addWidget(self.issues_label)
+        issues_layout.addWidget(self.issues_table)
+        self.preview_tabs.addTab(issues_page, "Issues")
+        self.duplicate_details = QPlainTextEdit()
+        self.duplicate_details.setReadOnly(True)
+        self.duplicate_details.setPlaceholderText("Выполните анализ для просмотра дубликатов.")
+        self.preview_tabs.addTab(self.duplicate_details, "Duplicate Analysis")
         self.preview_tabs.setTabEnabled(1, False)
+        self.preview_tabs.setTabEnabled(2, False)
+        self.preview_tabs.setTabEnabled(3, False)
         self.preview_tabs.currentChanged.connect(self._preview_changed)
         self.preview_tabs.setMinimumHeight(190)
         content.addWidget(self.preview_tabs, 1)
@@ -121,6 +150,9 @@ class MainWindow(QMainWindow):
         self.preview_label.setWordWrap(True)
         content.addWidget(self.preview_label)
         content.addWidget(self._summary_panel())
+        self.save_button = QPushButton("Save Cleaned File…")
+        self.save_button.clicked.connect(self._choose_destination)
+        content.addWidget(self.save_button, alignment=Qt.AlignmentFlag.AlignLeft)
         self.status_label = QLabel("Выберите .xlsx или .csv для просмотра и очистки.")
         self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         self.status_label.setWordWrap(True)
@@ -226,13 +258,34 @@ class MainWindow(QMainWindow):
         )
         hint.setWordWrap(True)
         content.addWidget(hint)
+        duplicate_group = QGroupBox("Duplicate Settings")
+        duplicate_layout = QVBoxLayout(duplicate_group)
+        self.duplicate_mode_combo = QComboBox()
+        self.duplicate_mode_combo.addItem("All Columns", "all")
+        self.duplicate_mode_combo.addItem("Selected Columns", "selected")
+        self.duplicate_mode_combo.currentIndexChanged.connect(self._duplicate_mode_changed)
+        duplicate_layout.addWidget(self.duplicate_mode_combo)
+        self.column_model = ColumnSelectionModel()
+        self.column_model.selection_changed.connect(self._plan_changed)
+        self.column_list = QListView()
+        self.column_list.setModel(self.column_model)
+        self.column_list.setUniformItemSizes(True)
+        self.column_list.setMinimumHeight(90)
+        self.column_list.setMaximumHeight(130)
+        self.column_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.column_list.hide()
+        duplicate_layout.addWidget(self.column_list)
+        self.duplicate_hint = QLabel(
+            "Сохраняется первое вхождение. В Selected Columns строки с пустым ключом "
+            "сохраняются и попадают в Issues."
+        )
+        self.duplicate_hint.setWordWrap(True)
+        duplicate_layout.addWidget(self.duplicate_hint)
+        content.addWidget(duplicate_group)
         actions = QHBoxLayout()
         self.analyze_button = QPushButton("Analyze && Clean")
         self.analyze_button.clicked.connect(self._analyze)
-        self.save_button = QPushButton("Save Cleaned File…")
-        self.save_button.clicked.connect(self._choose_destination)
         actions.addWidget(self.analyze_button)
-        actions.addWidget(self.save_button)
         actions.addStretch()
         content.addLayout(actions)
         return group
@@ -254,12 +307,12 @@ class MainWindow(QMainWindow):
             "Выполните анализ, чтобы увидеть операции и предупреждения."
         )
         self.report_details.setMinimumHeight(60)
-        self.report_details.setMaximumHeight(85)
+        self.report_details.setMaximumHeight(110)
         grid.addWidget(self.report_details, 3, 0, 1, 4)
         return group
 
     @staticmethod
-    def _table_view(model: PreviewTableModel) -> QTableView:
+    def _table_view(model: QAbstractTableModel) -> QTableView:
         table = QTableView()
         table.setModel(model)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -272,8 +325,17 @@ class MainWindow(QMainWindow):
         return CsvOptions(self.encoding_combo.currentData(), self.delimiter_combo.currentData())
 
     def cleaning_plan(self) -> CleaningPlan:
+        duplicate_columns = None
+        if (
+            self.operation_checks["remove_duplicates"].isChecked()
+            and self.duplicate_mode_combo.currentData() == "selected"
+        ):
+            duplicate_columns = self.column_model.selected_columns
+            if not duplicate_columns:
+                raise CleaningError("Selected Columns: выберите хотя бы один ключевой столбец.")
         return CleaningPlan(
-            **{name: check.isChecked() for name, check in self.operation_checks.items()}
+            **{name: check.isChecked() for name, check in self.operation_checks.items()},
+            duplicate_columns=duplicate_columns,
         )
 
     def _invalidate_result(self) -> None:
@@ -282,6 +344,11 @@ class MainWindow(QMainWindow):
         self.cleaned_model.set_preview(None)
         self.preview_tabs.setCurrentIndex(0)
         self.preview_tabs.setTabEnabled(1, False)
+        self.preview_tabs.setTabEnabled(2, False)
+        self.preview_tabs.setTabEnabled(3, False)
+        self.issues_model.set_issues(())
+        self.issues_label.setText("Выполните анализ для просмотра проблем.")
+        self.duplicate_details.clear()
         for label in self.summary_values.values():
             label.setText("—")
         self.report_details.clear()
@@ -297,9 +364,15 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Операции изменены. Выполните анализ перед сохранением.")
 
     @Slot()
+    def _duplicate_mode_changed(self) -> None:
+        self.column_list.setVisible(self.duplicate_mode_combo.currentData() == "selected")
+        self._plan_changed()
+
+    @Slot()
     def _source_options_changed(self) -> None:
         self._invalidate_result()
         self.model.set_preview(None)
+        self.column_model.set_columns((), 0)
         self._preview_changed()
         if self._path is not None:
             self.status_label.setText(
@@ -322,6 +395,7 @@ class MainWindow(QMainWindow):
         self._path = path
         self._invalidate_result()
         self.model.set_preview(None)
+        self.column_model.set_columns((), 0)
         self._preview_changed()
         self.file_label.setText(f"Файл: {path.name}")
         self.file_label.setToolTip(str(path))
@@ -359,12 +433,20 @@ class MainWindow(QMainWindow):
         if self._cleaning_service is None:
             return
         self._invalidate_result()
+        try:
+            plan = self.cleaning_plan()
+        except CleaningError as exc:
+            self._operation = "analyze"
+            self._worker_revision = self._revision
+            self._failed(str(exc))
+            self._operation = None
+            return
         self.status_label.setText("Анализ и очистка полного файла…")
         task = partial(
             analyze_for_display,
             self._cleaning_service,
             self._path,
-            self.cleaning_plan(),
+            plan,
             self.sheet_combo.currentText() or None,
             self._csv_options(),
         )
@@ -372,9 +454,15 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _choose_destination(self) -> None:
-        if self._worker is not None or self._closing or self._job is None:
+        if (
+            self._worker is not None
+            or self._closing
+            or self._job is None
+            or self._confirming_export
+        ):
             return
-        source = self._job.source.path
+        job, revision = self._job, self._revision
+        source = job.source.path
         suggested = source.with_name(f"{source.stem}_cleaned{source.suffix}")
         file_filter = "Excel (*.xlsx)" if source.suffix.lower() == ".xlsx" else "CSV (*.csv)"
         filename, _ = QFileDialog.getSaveFileName(
@@ -384,23 +472,61 @@ class MainWindow(QMainWindow):
             file_filter,
             options=QFileDialog.Option.DontConfirmOverwrite,
         )
-        if filename:
+        if filename and self._job is job and self._revision == revision:
             destination = Path(filename)
             if not destination.suffix:
                 destination = destination.with_suffix(source.suffix)
             self.save_cleaned_file(destination)
 
     def save_cleaned_file(self, destination: Path) -> None:
-        if self._worker is not None or self._closing or self._job is None:
+        if (
+            self._worker is not None
+            or self._closing
+            or self._job is None
+            or self._confirming_export
+        ):
             return
         if self._cleaning_service is None:
             return
+        job, revision = self._job, self._revision
+        conflicts = job.result.report.conflicting_duplicate_groups
+        confirmed = False
+        if conflicts:
+            self._confirming_export = True
+            try:
+                answer = QMessageBox.warning(
+                    self,
+                    "Конфликтующие дубликаты",
+                    f"Конфликтующих групп: {conflicts}.\n"
+                    "Ключи совпадают, но значения в неключевых столбцах различаются.\n"
+                    "Будут сохранены первые вхождения, остальные строки будут удалены.\n"
+                    "Проверьте вкладку Duplicate Analysis. Подтвердить экспорт?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+            finally:
+                self._confirming_export = False
+            if (
+                self._job is not job
+                or self._revision != revision
+                or self._closing
+                or self._worker is not None
+            ):
+                return
+            if answer != QMessageBox.StandardButton.Yes:
+                self.status_label.setText(
+                    "Экспорт отменён. Результат анализа доступен для проверки."
+                )
+                return
+            confirmed = True
         self._clear_errors()
         self.saved_label.clear()
         self.saved_label.hide()
         self.status_label.setText("Сохранение очищенного файла…")
         destination = destination.absolute()
-        task = partial(export_file, self._cleaning_service, self._job, destination)
+        task = partial(
+            export_file, self._cleaning_service, job, destination, confirm_conflicts=confirmed
+        )
         self._start_worker(ServiceWorker(task, "экспорт"), "export", self._exported)
 
     def _accept_result(self) -> bool:
@@ -408,6 +534,11 @@ class MainWindow(QMainWindow):
 
     def _show_original(self, preview: Preview) -> None:
         self.model.set_preview(preview)
+        headers = preview.column_headers or (preview.rows[0] if preview.rows else ())
+        column_count = preview.available_column_count
+        if column_count is None:
+            column_count = preview.column_count
+        self.column_model.set_columns(headers, column_count, preserve_selection=True)
         with QSignalBlocker(self.sheet_combo):
             self.sheet_combo.clear()
             self.sheet_combo.addItems(preview.sheet_names)
@@ -436,15 +567,139 @@ class MainWindow(QMainWindow):
         titles = dict(OPERATIONS)
         operations = ", ".join(titles.get(name, name) for name in report.performed_operations)
         details = f"Выполненные операции: {operations or 'не выбраны'}."
+        details += (
+            f"\nDuplicate Groups: {report.duplicate_group_count}; "
+            f"Conflicting Groups: {report.conflicting_duplicate_groups}; "
+            f"Missing Key Rows: {report.missing_key_rows}; Issues: {report.issue_count}."
+        )
         if report.warnings:
             details += "\nПредупреждения:\n" + "\n".join(report.warnings)
         else:
             details += "\nПредупреждений нет."
         self.report_details.setPlainText(details)
+        self._show_issues(report)
+        self._show_duplicate_analysis(report)
         self.preview_tabs.setTabEnabled(1, True)
+        self.preview_tabs.setTabEnabled(2, True)
+        self.preview_tabs.setTabEnabled(3, True)
         self.preview_tabs.setCurrentIndex(1)
         self._preview_changed()
-        self.status_label.setText("Анализ завершён. Результат можно сохранить в новый файл.")
+        self.status_label.setText(
+            f"Внимание: конфликтующих групп — {report.conflicting_duplicate_groups}. "
+            "Проверьте Duplicate Analysis; экспорт требует отдельного подтверждения."
+            if report.conflicting_duplicate_groups
+            else "Анализ завершён. Результат можно сохранить в новый файл."
+        )
+
+    def _show_issues(self, report: CleaningReport) -> None:
+        issues = report.issues[:ISSUE_DISPLAY_LIMIT]
+        self.issues_model.set_issues(issues)
+        text = f"Issues: {report.issue_count}. Missing Key Rows: {report.missing_key_rows}."
+        if len(issues) < report.issue_count:
+            text += f" Showing first {len(issues)} of {report.issue_count} issues."
+        text += " Номера строк относятся к исходному файлу; заголовок — строка 1."
+        self.issues_label.setText(text)
+
+    def _column_names(self, columns: tuple[int, ...]) -> str:
+        labels = [self.column_model.column_label(index) for index in columns[:DETAIL_COLUMN_LIMIT]]
+        if len(columns) > DETAIL_COLUMN_LIMIT:
+            labels.append(f"… (показано {DETAIL_COLUMN_LIMIT} из {len(columns)} столбцов)")
+        return ", ".join(labels)
+
+    @staticmethod
+    def _cell_description(cell: Cell) -> str:
+        value = repr(cell.value)
+        if len(value) > 100:
+            value = value[:100] + "…"
+        return f"{value} ({type(cell.value).__name__}) [cell:{cell.data_type}]"
+
+    def _row_description(self, values: tuple[Cell, ...], columns: tuple[int, ...]) -> str:
+        parts = [
+            f"{self.column_model.column_label(index)} = "
+            f"{self._cell_description(values[index] if index < len(values) else Cell(None))}"
+            for index in columns
+        ]
+        if len(values) > len(columns):
+            parts.append(f"… (показано {len(columns)} из {len(values)} значений)")
+        return "; ".join(parts)
+
+    def _show_duplicate_analysis(self, report: CleaningReport) -> None:
+        sections = []
+        size = 0
+        for index, group in enumerate(report.duplicate_groups[:DUPLICATE_DISPLAY_LIMIT], 1):
+            key = "; ".join(
+                f"{self.column_model.column_label(column)} = {self._cell_description(value)}"
+                for column, value in zip(
+                    report.duplicate_columns[:DETAIL_COLUMN_LIMIT],
+                    group.key[:DETAIL_COLUMN_LIMIT],
+                    strict=True,
+                )
+            )
+            if len(group.key) > DETAIL_COLUMN_LIMIT:
+                key += f"; … (показано {DETAIL_COLUMN_LIMIT} из {len(group.key)} ключей)"
+            columns = tuple(
+                sorted(
+                    set(range(min(len(group.kept_values), DETAIL_COLUMN_LIMIT)))
+                    | set(group.conflicting_columns[:DETAIL_COLUMN_LIMIT])
+                )
+            )
+            lines = [
+                f"Duplicate Group {index}",
+                f"Key: {key}",
+                f"Keep: Row {group.kept_source_row} | "
+                f"{self._row_description(group.kept_values, columns)}",
+                f"Remove: {group.removed_count} rows.",
+            ]
+            if group.conflicting_columns:
+                lines.append(
+                    "WARNING: различаются значения в неключевых столбцах: "
+                    + self._column_names(group.conflicting_columns)
+                    + "."
+                )
+            else:
+                lines.append("Различий в неключевых столбцах нет.")
+            samples = tuple(
+                zip(
+                    group.removed_source_rows[:REMOVED_SAMPLE_LIMIT],
+                    group.removed_values[:REMOVED_SAMPLE_LIMIT],
+                    strict=True,
+                )
+            )
+            for source_row, values in samples:
+                lines.append(f"Remove: Row {source_row} | {self._row_description(values, columns)}")
+            if len(samples) < group.removed_count:
+                lines.append(f"Showing first {len(samples)} of {group.removed_count} removed rows.")
+            section = "\n".join(lines)
+            if size + len(section) > DETAIL_TEXT_LIMIT:
+                break
+            sections.append(section)
+            size += len(section)
+        mode = self.duplicate_mode_combo.currentText()
+        compared = self._column_names(report.duplicate_columns) or "не выполнялось"
+        header = (
+            f"Removed Duplicates: {report.removed_duplicates}. "
+            f"Duplicate Groups: {report.duplicate_group_count}.\n"
+            f"Comparison: {mode} — {compared}.\n"
+            f"Conflicting Groups: {report.conflicting_duplicate_groups}. "
+            f"Missing Key Rows: {report.missing_key_rows}.\n"
+            "Номера строк исходные; значения после Trim (если включён). "
+            "Длинные значения сокращены до 100 символов; типы указаны в скобках."
+        )
+        if len(sections) < report.duplicate_group_count:
+            header += (
+                f"\nShowing first {len(sections)} of {report.duplicate_group_count} "
+                "duplicate groups. "
+                "Лимит: 100 групп и 300 000 символов подробностей."
+            )
+        if report.conflicting_duplicate_groups:
+            header += (
+                "\nWARNING: удаление конфликтующих записей требует отдельного "
+                "подтверждения экспорта. "
+                "Конфликт может находиться за пределами показанных примеров."
+            )
+        self.duplicate_details.setPlainText(
+            header + ("\n\n" + "\n\n".join(sections) if sections else "")
+        )
 
     @Slot(object)
     def _exported(self, destination: Path) -> None:
@@ -467,6 +722,11 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _preview_changed(self) -> None:
+        if self.preview_tabs.currentIndex() >= 2:
+            self.preview_label.setText(
+                "Подробности из последнего анализа всего файла. Номера строк исходные."
+            )
+            return
         model = self.model if self.preview_tabs.currentIndex() == 0 else self.cleaned_model
         preview = model.preview
         if preview is None:
@@ -477,6 +737,7 @@ class MainWindow(QMainWindow):
             message += " Таблица пуста."
         if preview.more_rows:
             message += " Есть строки за пределами предпросмотра."
+            message += " Столбцы без заголовков за пределами предпросмотра появятся после анализа."
         if preview.more_columns:
             message += " Столбцы после 200-го скрыты."
         if preview.csv_options:
@@ -522,6 +783,9 @@ class MainWindow(QMainWindow):
         self.delimiter_combo.setEnabled(ready)
         for check in self.operation_checks.values():
             check.setEnabled(ready)
+        duplicates_enabled = self.operation_checks["remove_duplicates"].isChecked()
+        self.duplicate_mode_combo.setEnabled(ready and duplicates_enabled)
+        self.column_list.setEnabled(ready and duplicates_enabled)
         self.analyze_button.setEnabled(
             ready and self._path is not None and self._cleaning_service is not None
         )

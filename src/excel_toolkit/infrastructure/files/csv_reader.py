@@ -31,6 +31,8 @@ def detect_delimiter(sample: str) -> str:
 
 def read_csv(path: Path, options: CsvOptions, cancelled: CancelCheck) -> Preview:
     rows: list[tuple[Cell, ...]] = []
+    headers: tuple[Cell, ...] = ()
+    width = 0
     more_rows = more_columns = False
     with path.open("r", encoding=options.encoding, newline="") as stream:
         check_cancelled(cancelled)
@@ -49,11 +51,18 @@ def read_csv(path: Path, options: CsvOptions, cancelled: CancelCheck) -> Preview
                 more_rows = True
                 break
             more_columns |= len(row) > COLUMN_LIMIT
-            rows.append(tuple(Cell(value) for value in row[:COLUMN_LIMIT]))
+            width = max(width, len(row))
+            if index == 0:
+                headers = tuple(Cell(value) for value in row)
+                rows.append(headers[:COLUMN_LIMIT])
+            else:
+                rows.append(tuple(Cell(value) for value in row[:COLUMN_LIMIT]))
     return Preview(
         path=path,
         rows=tuple(rows),
         more_rows=more_rows,
         more_columns=more_columns,
         csv_options=CsvOptions(options.encoding, delimiter),
+        column_headers=headers,
+        available_column_count=width,
     )

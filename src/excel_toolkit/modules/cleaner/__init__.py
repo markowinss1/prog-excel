@@ -6,6 +6,8 @@ from excel_toolkit.modules.cleaner.models import (
     CleaningPlan,
     CleaningReport,
     CleaningResult,
+    DataIssue,
+    DuplicateGroup,
     MissingValue,
     Table,
 )
@@ -15,6 +17,8 @@ __all__ = [
     "CleaningPlan",
     "CleaningReport",
     "CleaningResult",
+    "DataIssue",
+    "DuplicateGroup",
     "MissingValue",
     "Table",
     "clean",

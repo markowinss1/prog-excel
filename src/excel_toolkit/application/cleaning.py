@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Protocol
 
 from excel_toolkit.application.models import COLUMN_LIMIT, ROW_LIMIT, CsvOptions, Preview
-from excel_toolkit.modules.cleaner import CleaningPlan, CleaningResult, Table, clean
+from excel_toolkit.modules.cleaner import CleaningError, CleaningPlan, CleaningResult, Table, clean
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,8 @@ class CleaningJob:
                 more_rows=len(table.rows) > ROW_LIMIT,
                 more_columns=any(len(row) > COLUMN_LIMIT for row in table.rows),
                 csv_options=self.source.csv_options,
+                column_headers=table.rows[0] if table.rows else (),
+                available_column_count=table.column_count,
             )
             for table in (self.source.table, self.result.table)
         )
@@ -97,5 +99,20 @@ class CleaningService:
             )
         return CleaningJob(source, result)
 
-    def export(self, job: CleaningJob, destination: str | Path) -> None:
+    def export(
+        self,
+        job: CleaningJob,
+        destination: str | Path,
+        *,
+        confirm_conflicts: bool = False,
+    ) -> None:
+        """Export this analyzed snapshot; conflicting deletions require explicit consent."""
+        if type(confirm_conflicts) is not bool:
+            raise CleaningError("Подтверждение конфликтов должно быть bool.")
+        count = job.result.report.conflicting_duplicate_groups
+        if count and not confirm_conflicts:
+            raise CleaningError(
+                f"Экспорт требует отдельного подтверждения: конфликтующих групп — {count}. "
+                "Неключевые значения различаются; сохраняется первая исходная строка."
+            )
         self._storage.write(job, Path(destination))

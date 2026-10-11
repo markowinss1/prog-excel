@@ -25,6 +25,8 @@ def read_xlsx(path: Path, sheet: str | None, cancelled: CancelCheck) -> Preview:
             # Some producers write incorrect dimensions. Read actual XML rows.
             worksheet.reset_dimensions()
             rows: list[tuple[Cell, ...]] = []
+            headers: tuple[Cell, ...] = ()
+            width = 0
             more_rows = more_columns = False
             iterator = worksheet.iter_rows(max_row=ROW_LIMIT + 1)
             try:
@@ -34,14 +36,25 @@ def read_xlsx(path: Path, sheet: str | None, cancelled: CancelCheck) -> Preview:
                         more_rows = True
                         break
                     more_columns |= len(row) > COLUMN_LIMIT
-                    rows.append(
-                        tuple(
-                            Cell(cell.value, cell.data_type, cell.number_format)
-                            for cell in row[:COLUMN_LIMIT]
-                        )
+                    width = max(width, len(row))
+                    cells = tuple(
+                        Cell(cell.value, cell.data_type, cell.number_format)
+                        for cell in (row if index == 0 else row[:COLUMN_LIMIT])
                     )
+                    if index == 0:
+                        headers = cells
+                    rows.append(cells[:COLUMN_LIMIT])
             finally:
                 iterator.close()
-            return Preview(path, tuple(rows), names, selected, more_rows, more_columns)
+            return Preview(
+                path,
+                tuple(rows),
+                names,
+                selected,
+                more_rows,
+                more_columns,
+                column_headers=headers,
+                available_column_count=width,
+            )
         finally:
             workbook.close()

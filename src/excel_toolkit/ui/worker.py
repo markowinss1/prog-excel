@@ -61,6 +61,12 @@ def analyze_for_display(
     return job, original, cleaned
 
 
-def export_file(service: CleaningService, job: CleaningJob, destination: Path) -> Path:
-    service.export(job, destination)
+def export_file(
+    service: CleaningService,
+    job: CleaningJob,
+    destination: Path,
+    *,
+    confirm_conflicts: bool = False,
+) -> Path:
+    service.export(job, destination, confirm_conflicts=confirm_conflicts)
     return destination

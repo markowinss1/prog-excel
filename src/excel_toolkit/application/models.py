@@ -39,6 +39,10 @@ class Preview:
     more_rows: bool = False
     more_columns: bool = False
     csv_options: CsvOptions | None = None
+    # Column selection is independent of the 200-column display limit. Initial
+    # previews know the full header and sampled width; analysis knows all rows.
+    column_headers: tuple[Cell, ...] = ()
+    available_column_count: int | None = None
 
     @property
     def column_count(self) -> int:

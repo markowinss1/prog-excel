@@ -56,13 +56,12 @@ def main():
                         path, CleaningPlan(True, True, True, True, duplicate_columns=columns)
                     )
                     analyzed = perf_counter()
-                    # Synthetic benchmark intentionally accepts known conflicting groups.
-                    service.export(job, output, confirm_conflicts=True)
+                    service.export(job, output)
                     exported = perf_counter()
                     if repetition:
                         samples.append({"analyze": analyzed - start, "export": exported - analyzed})
                     report = job.result.report
-                    expected = (9902, 99, 0, 0) if columns is None else (5051, 4950, 4950, 100)
+                    expected = (9902, 99, 0, 0) if columns is None else (10001, 0, 4950, 100)
                     assert (
                         report.final_rows,
                         report.removed_duplicates,

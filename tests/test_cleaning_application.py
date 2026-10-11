@@ -98,3 +98,43 @@ def test_empty_previews_and_formula_warning():
     assert original.rows == cleaned.rows == ()
     assert not original.more_rows and not original.more_columns
     assert "кэш" in job.result.report.warnings[0]
+
+
+@pytest.mark.parametrize("legacy_confirmation", [False, True])
+def test_conflicting_jobs_export_safely_without_changing_the_analyzed_snapshot(legacy_confirmation):
+    source = CleaningSource(
+        Path("source.csv"),
+        Table(
+            (
+                (Cell("ID"), Cell("City")),
+                (Cell(" 00123 "), Cell("Astana")),
+                (Cell("00123"), Cell("Almaty")),
+                (Cell("00123"), Cell("Almaty")),
+            )
+        ),
+    )
+    writes = []
+
+    class Storage:
+        def read(self, *args):
+            return source
+
+        def validate(self, original, result):
+            assert original is source
+            assert result.source_rows == (1, 2, 3)
+
+        def write(self, job, destination):
+            writes.append((job, destination))
+
+    service = CleaningService(Storage())
+    plan = CleaningPlan(trim_whitespace=True, remove_duplicates=True, duplicate_columns=(0,))
+    job = service.analyze("source.csv", plan)
+    assert job.result.report.conflicting_duplicate_groups == 1
+    assert job.result.report.removed_duplicates == 1
+    assert job.result.report.warnings
+    service.export(job, "first.csv", confirm_conflicts=legacy_confirmation)
+    service.export(job, "second.csv")
+    assert writes == [(job, Path("first.csv")), (job, Path("second.csv"))]
+    assert all(written is job for written, _ in writes)
+    assert source.table.rows[1][0].value == " 00123 "
+    assert service.analyze("source.csv", plan) == job

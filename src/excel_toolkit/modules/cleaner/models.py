@@ -92,6 +92,13 @@ class DuplicateGroup:
     removed_values: tuple[tuple[Cell, ...], ...]
     removed_count: int  # Full count, including removed rows beyond the sample limit.
     conflicting_columns: tuple[int, ...]  # Zero-based indexes, including unsampled rows.
+    retained_source_rows: tuple[int, ...] = ()  # Samples include the first representative.
+    retained_values: tuple[tuple[Cell, ...], ...] = ()
+    retained_count: int = 1  # Full count of distinct retained records, including unsampled rows.
+
+    @property
+    def status(self) -> str:
+        return "Conflict — Needs Review" if self.conflicting_columns else "Identical — Removed"
 
 
 @dataclass(frozen=True)

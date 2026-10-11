@@ -106,13 +106,11 @@ class CleaningService:
         *,
         confirm_conflicts: bool = False,
     ) -> None:
-        """Export this analyzed snapshot; conflicting deletions require explicit consent."""
+        """Export the safe snapshot, including unresolved conflicting records.
+
+        ``confirm_conflicts`` is retained for API compatibility only. It cannot
+        authorize deletion of conflicts; resolving those requires row-level choices.
+        """
         if type(confirm_conflicts) is not bool:
             raise CleaningError("Подтверждение конфликтов должно быть bool.")
-        count = job.result.report.conflicting_duplicate_groups
-        if count and not confirm_conflicts:
-            raise CleaningError(
-                f"Экспорт требует отдельного подтверждения: конфликтующих групп — {count}. "
-                "Неключевые значения различаются; сохраняется первая исходная строка."
-            )
         self._storage.write(job, Path(destination))

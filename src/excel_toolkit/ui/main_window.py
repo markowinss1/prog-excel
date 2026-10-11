@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QListView,
     QListWidget,
     QMainWindow,
-    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -56,7 +55,7 @@ SUMMARY_FIELDS = (
 )
 ISSUE_DISPLAY_LIMIT = 100
 DUPLICATE_DISPLAY_LIMIT = 100
-REMOVED_SAMPLE_LIMIT = 20
+ROW_SAMPLE_LIMIT = 20
 DETAIL_COLUMN_LIMIT = 12
 DETAIL_TEXT_LIMIT = 300_000
 
@@ -74,8 +73,8 @@ class MainWindow(QMainWindow):
         self._job: CleaningJob | None = None
         self._revision = 0
         self._worker_revision = 0
+        self._export_conflicts = 0
         self._closing = False
-        self._confirming_export = False
         self.setWindowTitle("Excel Freelancer Toolkit")
         self.resize(1100, 900)
         self.setMinimumSize(760, 540)
@@ -454,12 +453,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _choose_destination(self) -> None:
-        if (
-            self._worker is not None
-            or self._closing
-            or self._job is None
-            or self._confirming_export
-        ):
+        if self._worker is not None or self._closing or self._job is None:
             return
         job, revision = self._job, self._revision
         source = job.source.path
@@ -479,54 +473,18 @@ class MainWindow(QMainWindow):
             self.save_cleaned_file(destination)
 
     def save_cleaned_file(self, destination: Path) -> None:
-        if (
-            self._worker is not None
-            or self._closing
-            or self._job is None
-            or self._confirming_export
-        ):
+        if self._worker is not None or self._closing or self._job is None:
             return
         if self._cleaning_service is None:
             return
-        job, revision = self._job, self._revision
-        conflicts = job.result.report.conflicting_duplicate_groups
-        confirmed = False
-        if conflicts:
-            self._confirming_export = True
-            try:
-                answer = QMessageBox.warning(
-                    self,
-                    "Конфликтующие дубликаты",
-                    f"Конфликтующих групп: {conflicts}.\n"
-                    "Ключи совпадают, но значения в неключевых столбцах различаются.\n"
-                    "Будут сохранены первые вхождения, остальные строки будут удалены.\n"
-                    "Проверьте вкладку Duplicate Analysis. Подтвердить экспорт?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-            finally:
-                self._confirming_export = False
-            if (
-                self._job is not job
-                or self._revision != revision
-                or self._closing
-                or self._worker is not None
-            ):
-                return
-            if answer != QMessageBox.StandardButton.Yes:
-                self.status_label.setText(
-                    "Экспорт отменён. Результат анализа доступен для проверки."
-                )
-                return
-            confirmed = True
+        job = self._job
+        self._export_conflicts = job.result.report.conflicting_duplicate_groups
         self._clear_errors()
         self.saved_label.clear()
         self.saved_label.hide()
         self.status_label.setText("Сохранение очищенного файла…")
         destination = destination.absolute()
-        task = partial(
-            export_file, self._cleaning_service, job, destination, confirm_conflicts=confirmed
-        )
+        task = partial(export_file, self._cleaning_service, job, destination)
         self._start_worker(ServiceWorker(task, "экспорт"), "export", self._exported)
 
     def _accept_result(self) -> bool:
@@ -568,7 +526,7 @@ class MainWindow(QMainWindow):
         operations = ", ".join(titles.get(name, name) for name in report.performed_operations)
         details = f"Выполненные операции: {operations or 'не выбраны'}."
         details += (
-            f"\nDuplicate Groups: {report.duplicate_group_count}; "
+            f"\nDuplicate Groups (repeated keys): {report.duplicate_group_count}; "
             f"Conflicting Groups: {report.conflicting_duplicate_groups}; "
             f"Missing Key Rows: {report.missing_key_rows}; Issues: {report.issue_count}."
         )
@@ -586,7 +544,8 @@ class MainWindow(QMainWindow):
         self._preview_changed()
         self.status_label.setText(
             f"Внимание: конфликтующих групп — {report.conflicting_duplicate_groups}. "
-            "Проверьте Duplicate Analysis; экспорт требует отдельного подтверждения."
+            "Все различающиеся варианты сохранены. Конфликты не разрешены; "
+            "проверьте Duplicate Analysis. Результат можно сохранить в новый файл."
             if report.conflicting_duplicate_groups
             else "Анализ завершён. Результат можно сохранить в новый файл."
         )
@@ -645,10 +604,10 @@ class MainWindow(QMainWindow):
             )
             lines = [
                 f"Duplicate Group {index}",
+                f"Status: {group.status}",
                 f"Key: {key}",
-                f"Keep: Row {group.kept_source_row} | "
-                f"{self._row_description(group.kept_values, columns)}",
-                f"Remove: {group.removed_count} rows.",
+                f"Retained: {group.retained_count} rows.",
+                f"Automatically Removed Identical Rows: {group.removed_count}.",
             ]
             if group.conflicting_columns:
                 lines.append(
@@ -658,10 +617,24 @@ class MainWindow(QMainWindow):
                 )
             else:
                 lines.append("Различий в неключевых столбцах нет.")
+            retained_samples = tuple(
+                zip(
+                    group.retained_source_rows[: ROW_SAMPLE_LIMIT + 1],
+                    group.retained_values[: ROW_SAMPLE_LIMIT + 1],
+                    strict=True,
+                )
+            )
+            for source_row, values in retained_samples:
+                lines.append(f"Keep: Row {source_row} | {self._row_description(values, columns)}")
+            if len(retained_samples) < group.retained_count:
+                lines.append(
+                    f"Showing first {len(retained_samples)} of {group.retained_count} "
+                    "retained rows."
+                )
             samples = tuple(
                 zip(
-                    group.removed_source_rows[:REMOVED_SAMPLE_LIMIT],
-                    group.removed_values[:REMOVED_SAMPLE_LIMIT],
+                    group.removed_source_rows[:ROW_SAMPLE_LIMIT],
+                    group.removed_values[:ROW_SAMPLE_LIMIT],
                     strict=True,
                 )
             )
@@ -677,8 +650,8 @@ class MainWindow(QMainWindow):
         mode = self.duplicate_mode_combo.currentText()
         compared = self._column_names(report.duplicate_columns) or "не выполнялось"
         header = (
-            f"Removed Duplicates: {report.removed_duplicates}. "
-            f"Duplicate Groups: {report.duplicate_group_count}.\n"
+            f"Removed Duplicates (identical rows): {report.removed_duplicates}. "
+            f"Duplicate Groups (repeated keys): {report.duplicate_group_count}.\n"
             f"Comparison: {mode} — {compared}.\n"
             f"Conflicting Groups: {report.conflicting_duplicate_groups}. "
             f"Missing Key Rows: {report.missing_key_rows}.\n"
@@ -693,8 +666,8 @@ class MainWindow(QMainWindow):
             )
         if report.conflicting_duplicate_groups:
             header += (
-                "\nWARNING: удаление конфликтующих записей требует отдельного "
-                "подтверждения экспорта. "
+                "\nWARNING: конфликтующие варианты сохранены для ручной проверки. "
+                "Конфликты не разрешены; экспорт сохранит все различающиеся варианты. "
                 "Конфликт может находиться за пределами показанных примеров."
             )
         self.duplicate_details.setPlainText(
@@ -704,9 +677,21 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _exported(self, destination: Path) -> None:
         if not self._closing:
-            self.saved_label.setText(f"Сохранено: {destination}")
+            message = f"Сохранено: {destination}"
+            conflicts = self._export_conflicts
+            if conflicts:
+                message += (
+                    f"\nВнимание: конфликты не разрешены. Конфликтующих групп: {conflicts}. "
+                    "Все различающиеся варианты сохранены в файле; "
+                    "проверьте Duplicate Analysis."
+                )
+            self.saved_label.setText(message)
             self.saved_label.show()
-            self.status_label.setText("Очищенный файл сохранён.")
+            self.status_label.setText(
+                "Файл сохранён. Конфликты не разрешены; варианты сохранены для ручной проверки."
+                if conflicts
+                else "Очищенный файл сохранён."
+            )
             QTimer.singleShot(0, self, self._reveal_feedback)
 
     def _clear_errors(self) -> None:

@@ -11,6 +11,7 @@ from excel_toolkit.modules.cleaner import (
     CleaningPlan,
     CleaningReport,
     DataIssue,
+    DuplicateGroup,
     Table,
     clean,
 )
@@ -20,7 +21,7 @@ def table(*rows):
     return Table(tuple(tuple(v if isinstance(v, Cell) else Cell(v) for v in row) for row in rows))
 
 
-def test_selected_column_keeps_first_record_and_original_order_with_conflict_details():
+def test_selected_column_keeps_each_distinct_record_in_original_order_with_conflict_details():
     source = table(
         ["ID", "Name", "City"],
         ["00123", "Alex", "Astana"],
@@ -31,20 +32,26 @@ def test_selected_column_keeps_first_record_and_original_order_with_conflict_det
     )
     result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)))
     report = result.report
-    assert result.source_rows == (1, 2, 3, 5)
-    assert report.removed_duplicates == 2
+    assert result.source_rows == (1, 2, 3, 4, 5)
+    assert report.removed_duplicates == 1
     assert report.duplicate_columns == (0,)
     assert report.duplicate_group_count == report.conflicting_duplicate_groups == 1
     group = report.duplicate_groups[0]
     assert group.key == (Cell("00123"),)
     assert group.kept_source_row == 2
     assert group.kept_values is source.rows[1]
-    assert group.removed_source_rows == (4, 6)
-    assert group.removed_values[0] is source.rows[3]
-    assert group.removed_count == 2
+    assert group.removed_source_rows == (6,)
+    assert group.removed_values[0] is source.rows[5]
+    assert group.removed_count == 1
+    assert group.retained_source_rows == (2, 4)
+    assert group.retained_values == (source.rows[1], source.rows[3])
+    assert group.retained_count == 2
     assert group.conflicting_columns == (2,)
+    assert group.status == "Conflict — Needs Review"
     assert result.table.rows[1] is source.rows[1]
     assert any("Конфликтующие группы дубликатов: 1" in text for text in report.warnings)
+    assert any("все отличающиеся записи сохранены" in text for text in report.warnings)
+    assert all("подтверждения" not in text for text in report.warnings)
     assert all("00123" not in text and "Alex" not in text for text in report.warnings)
 
 
@@ -57,10 +64,12 @@ def test_multiple_keys_use_indices_and_preserve_requested_order():
         ["002", "Astana", "d"],
     )
     result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(1, 0)))
-    assert result.source_rows == (1, 2, 3, 5)
+    assert result.source_rows == (1, 2, 3, 4, 5)
     assert result.report.duplicate_columns == (1, 0)
     assert result.report.duplicate_groups[0].key == (Cell("Astana"), Cell("001"))
     assert result.report.duplicate_groups[0].conflicting_columns == (2,)
+    assert result.report.removed_duplicates == 0
+    assert result.report.duplicate_groups[0].retained_source_rows == (2, 4)
 
 
 def test_all_columns_preserves_legacy_matching_of_missing_and_ragged_records():
@@ -73,6 +82,7 @@ def test_all_columns_preserves_legacy_matching_of_missing_and_ragged_records():
     assert result.report.missing_key_rows == result.report.issue_count == 0
     assert result.report.duplicate_groups[1].key == (Cell(None), Cell(None))
     assert result.report.duplicate_groups[1].kept_values == ()
+    assert all(group.status == "Identical — Removed" for group in result.report.duplicate_groups)
 
 
 def test_explicit_selection_of_every_column_still_protects_missing_keys():
@@ -159,7 +169,10 @@ def test_nonkey_conflicts_also_use_strict_value_and_cell_data_types():
         ["d", Cell(1, "n", "0")],
         ["d", Cell(1, "n", "000")],
     )
-    report = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,))).report
+    result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)))
+    report = result.report
+    assert result.source_rows == tuple(range(1, 9))
+    assert report.removed_duplicates == 1
     assert report.duplicate_group_count == 4
     assert report.conflicting_duplicate_groups == 3
     assert [group.conflicting_columns for group in report.duplicate_groups] == [
@@ -272,16 +285,19 @@ def test_conflicts_and_counts_cover_groups_and_rows_beyond_detail_limits():
             duplicate_row_detail_limit=1,
         ),
     ).report
-    assert report.removed_duplicates == 6
+    assert report.removed_duplicates == 2
     assert report.duplicate_group_count == report.conflicting_duplicate_groups == 2
     assert len(report.duplicate_groups) == 1
     group = report.duplicate_groups[0]
     assert group.removed_source_rows == (3,)
-    assert group.removed_count == 3
+    assert group.removed_count == 1
+    assert group.retained_count == 3
+    assert group.retained_source_rows == (2, 6)
+    assert group.retained_values == (source.rows[1], source.rows[5])
     assert group.conflicting_columns == (1, 2)
     assert len(group.removed_values) == 1
     assert any("1 из 2 групп" in warning for warning in report.warnings)
-    assert any("Примеры удаляемых строк усечены" in warning for warning in report.warnings)
+    assert any("Примеры сохранённых строк усечены" in warning for warning in report.warnings)
     assert any("Конфликтующие группы дубликатов: 2" in warning for warning in report.warnings)
 
 
@@ -297,7 +313,8 @@ def test_zero_detail_limits_keep_complete_counts_and_warnings():
             issue_detail_limit=0,
         ),
     ).report
-    assert report.removed_duplicates == report.duplicate_group_count == 1
+    assert report.removed_duplicates == 0
+    assert report.duplicate_group_count == 1
     assert report.conflicting_duplicate_groups == report.missing_key_rows == report.issue_count == 1
     assert report.duplicate_groups == report.issues == ()
     assert report.issues_truncated
@@ -313,7 +330,10 @@ def test_zero_removed_row_sample_still_reports_group_conflicts():
     ).report
     group = report.duplicate_groups[0]
     assert group.removed_source_rows == group.removed_values == ()
-    assert group.removed_count == 1
+    assert group.removed_count == 0
+    assert group.retained_source_rows == (2,)
+    assert group.retained_values == (source.rows[1],)
+    assert group.retained_count == 2
     assert group.conflicting_columns == (1,)
     assert report.conflicting_duplicate_groups == 1
 
@@ -354,12 +374,14 @@ def test_ten_thousand_rows_have_bounded_samples_and_complete_totals():
     )
     result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)))
     report = result.report
-    assert result.source_rows == tuple(range(1, 1002))
-    assert report.removed_duplicates == 9000
+    assert result.source_rows == tuple(range(1, 10002))
+    assert report.removed_duplicates == 0
     assert report.duplicate_group_count == report.conflicting_duplicate_groups == 1000
     assert len(report.duplicate_groups) == 100
-    assert all(group.removed_count == 9 for group in report.duplicate_groups)
-    assert all(len(group.removed_values) == 9 for group in report.duplicate_groups)
+    assert all(group.removed_count == 0 for group in report.duplicate_groups)
+    assert all(group.removed_values == () for group in report.duplicate_groups)
+    assert all(group.retained_count == 10 for group in report.duplicate_groups)
+    assert all(len(group.retained_values) == 10 for group in report.duplicate_groups)
     assert all(group.conflicting_columns == (1,) for group in report.duplicate_groups)
 
 
@@ -367,10 +389,13 @@ def test_one_large_group_retains_only_default_number_of_removed_row_samples():
     source = table(["ID", "Value"], *(["001", "same"] for _ in range(100)), ["001", "late"])
     report = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,))).report
     group = report.duplicate_groups[0]
-    assert report.removed_duplicates == group.removed_count == 100
+    assert report.removed_duplicates == group.removed_count == 99
     assert group.removed_source_rows == tuple(range(3, 23))
     assert group.conflicting_columns == (1,)
+    assert group.retained_source_rows == (2, 102)
+    assert group.retained_count == 2
     assert report.conflicting_duplicate_groups == 1
+    assert any("Примеры удаляемых строк усечены" in warning for warning in report.warnings)
 
 
 def test_ragged_nonkey_none_matches_explicit_none_without_conflict():
@@ -388,6 +413,171 @@ def test_formula_keys_are_not_missing_and_formula_deletion_restriction_remains()
     assert report.issues == (DataIssue(3, 1, "Missing Key"),)
     with pytest.raises(CleaningError, match="формулы"):
         clean(
-            table(["ID", "Value"], [Cell("=1", "f"), "x"], [Cell("=1", "f"), "y"]),
+            table(["ID", "Value"], [Cell("=1", "f"), "x"], [Cell("=1", "f"), "x"]),
             CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)),
         )
+
+
+def test_duplicates_of_every_conflicting_variant_are_removed_without_reordering():
+    source = table(
+        ["ID", "City", "Email"],
+        ["00123", "Astana", "alex@example.invalid"],
+        ["other", "Aktau", None],
+        ["00123", "Almaty", "alex@example.invalid"],
+        ["00123", "Almaty", "alex@example.invalid"],
+        ["other", "Aktau", "lee@example.invalid"],
+        ["00123", "Astana", "alex@example.invalid"],
+        ["00123", "Aktau", None],
+        ["00123", "Aktau", None],
+        [None, "Aktau", None],
+        [None, "Aktau", None],
+    )
+    result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)))
+    assert result.source_rows == (1, 2, 3, 4, 6, 8, 10, 11)
+    assert result.report.removed_duplicates == 3
+    assert result.report.duplicate_group_count == result.report.conflicting_duplicate_groups == 2
+    assert result.report.missing_key_rows == 2
+    group = result.report.duplicate_groups[0]
+    assert group.retained_source_rows == (2, 4, 8)
+    assert group.removed_source_rows == (5, 7, 9)
+    assert group.conflicting_columns == (1, 2)
+    assert group.retained_count == group.removed_count == 3
+
+
+@pytest.mark.parametrize("trim", [False, True])
+def test_nonkey_whitespace_only_normalizes_when_requested(trim):
+    source = table(["ID", "Name"], ["001", " Alex "], ["001", "Alex"])
+    result = clean(
+        source,
+        CleaningPlan(trim_whitespace=trim, remove_duplicates=True, duplicate_columns=(0,)),
+    )
+    assert result.source_rows == ((1, 2) if trim else (1, 2, 3))
+    assert result.report.removed_duplicates == int(trim)
+    assert result.report.conflicting_duplicate_groups == int(not trim)
+    assert result.report.duplicate_group_count == 1
+    assert source.rows[1][1].value == " Alex "
+
+
+def test_complementary_missing_values_are_retained_without_merging_or_selecting_best():
+    source = table(
+        ["ID", "Name", "Email"],
+        ["00999", "Lee", None],
+        ["00999", None, "lee@example.invalid"],
+        ["00999", "Lee", "lee@example.invalid"],
+    )
+    result = clean(
+        source,
+        CleaningPlan(remove_duplicates=True, duplicate_columns=(0,), detect_missing_values=True),
+    )
+    assert result.table == source
+    assert result.source_rows == (1, 2, 3, 4)
+    assert result.report.removed_duplicates == 0
+    assert result.report.missing_values == 2
+    assert result.report.duplicate_groups[0].conflicting_columns == (1, 2)
+    assert result.report.duplicate_groups[0].retained_count == 3
+    assert [(item.row, item.column, item.source_row) for item in result.report.missing_details] == [
+        (2, 3, 2),
+        (3, 2, 3),
+    ]
+
+
+def test_every_supported_nonkey_type_and_case_retains_its_own_first_variant():
+    variants = (
+        0,
+        False,
+        0.0,
+        "0",
+        "000",
+        "abc",
+        "ABC",
+        None,
+        "",
+        " ",
+        date(2026, 1, 2),
+        datetime(2026, 1, 2),
+        time(12),
+        timedelta(days=1),
+        Cell(0, "n"),
+    )
+    source = table(["ID", "Value"], *(["same", value] for value in variants + variants))
+    result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)))
+    assert result.source_rows == tuple(range(1, len(variants) + 2))
+    assert result.report.removed_duplicates == len(variants)
+    assert result.report.duplicate_group_count == result.report.conflicting_duplicate_groups == 1
+    group = result.report.duplicate_groups[0]
+    assert group.retained_count == group.removed_count == len(variants)
+    assert group.retained_values == source.rows[1 : len(variants) + 1]
+
+
+def test_repeat_analysis_is_deterministic_and_cleaned_conflicts_remain_unresolved():
+    source = table(
+        [" ID ", "Name"],
+        ["001", " Alex "],
+        [None, "person"],
+        ["001", "Alex"],
+        ["001", "Alexander"],
+        [None, "person"],
+        [None, None],
+    )
+    plan = CleaningPlan(True, True, True, True, True, (0,))
+    first = clean(source, plan)
+    assert clean(source, plan) == first
+    second = clean(first.table, plan)
+    assert second.table == first.table
+    assert second.source_rows == tuple(range(1, len(first.table.rows) + 1))
+    assert second.report.changed_text_cells == second.report.removed_empty_rows == 0
+    assert second.report.removed_duplicates == 0
+    assert second.report.duplicate_group_count == second.report.conflicting_duplicate_groups == 1
+    assert second.report.missing_key_rows == 2
+    assert second.report.duplicate_groups[0].retained_source_rows == (2, 4)
+    assert second.report.duplicate_groups[0].status == "Conflict — Needs Review"
+    assert source.rows[0][0].value == " ID "
+    assert source.rows[1][1].value == " Alex "
+
+
+def test_retained_sample_limit_does_not_control_deduplication_of_unsampled_variants():
+    source = table(
+        ["ID", "Value"],
+        *(["same", index] for index in range(50)),
+        *(["same", index] for index in range(50)),
+    )
+    result = clean(
+        source,
+        CleaningPlan(remove_duplicates=True, duplicate_columns=(0,), duplicate_row_detail_limit=2),
+    )
+    assert result.source_rows == tuple(range(1, 52))
+    assert result.report.removed_duplicates == 50
+    group = result.report.duplicate_groups[0]
+    assert group.retained_count == group.removed_count == 50
+    assert group.retained_source_rows == (2, 3, 4)
+    assert group.removed_source_rows == (52, 53)
+    assert len(group.retained_values) == 3
+    assert len(group.removed_values) == 2
+    assert group.conflicting_columns == (1,)
+
+
+def test_no_header_keeps_first_row_and_all_conflicting_variants():
+    source = table(["001", "Alex"], ["001", "Alexander"], ["001", "Alex"])
+    result = clean(
+        source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,), has_header=False)
+    )
+    assert result.source_rows == (1, 2)
+    group = result.report.duplicate_groups[0]
+    assert group.retained_source_rows == (1, 2)
+    assert group.removed_source_rows == (3,)
+
+
+def test_formula_conflicts_are_preserved_without_triggering_row_deletion_restriction():
+    source = table(["ID", "Value"], [Cell("=1", "f"), "x"], [Cell("=1", "f"), "y"])
+    result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)))
+    assert result.table == source
+    assert result.report.removed_duplicates == 0
+    assert result.report.conflicting_duplicate_groups == 1
+
+
+def test_existing_positional_duplicate_group_arguments_remain_compatible():
+    group = DuplicateGroup((Cell("a"),), 2, (Cell("a"),), (3,), ((Cell("a"),),), 1, ())
+    assert group.kept_source_row == 2
+    assert group.retained_source_rows == group.retained_values == ()
+    assert group.retained_count == 1
+    assert group.status == "Identical — Removed"

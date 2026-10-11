@@ -1,8 +1,9 @@
-"""Selected duplicate keys, bounded reports and per-export confirmation through real services."""
+"""Selected duplicate keys, bounded reports and safe conflict exports through real services."""
 
 import csv
 import os
 import time
+from threading import Event
 
 import pytest
 from openpyxl import Workbook
@@ -178,16 +179,22 @@ def test_all_columns_vs_selected_details_and_source_issue_rows(app, window, conf
     select(window, 0)
     analyze(app, window)
     report = window._job.result.report
-    assert report.removed_duplicates == 2
+    assert report.removed_duplicates == 1
     assert report.missing_key_rows == 2
     assert report.conflicting_duplicate_groups == 1
+    assert window._job.result.source_rows == (1, 2, 3, 5, 6)
     details = window.duplicate_details.toPlainText()
     for snippet in (
         "Comparison: Selected Columns — A — ID",
+        "Duplicate Groups (repeated keys): 1",
+        "Removed Duplicates (identical rows): 1",
+        "Status: Conflict — Needs Review",
         "Key: A — ID = '00123' (str)",
         "Keep: Row 2",
-        "Remove: Row 3",
+        "Keep: Row 3",
         "Remove: Row 4",
+        "Retained: 2 rows.",
+        "Automatically Removed Identical Rows: 1.",
         "WARNING:",
         "B — City",
         "Almaty",
@@ -195,6 +202,8 @@ def test_all_columns_vs_selected_details_and_source_issue_rows(app, window, conf
         "Missing Key Rows: 2",
     ):
         assert snippet in details
+    assert "Remove: Row 3" not in details
+    assert "Конфликты не разрешены" in window.status_label.text()
     issues = {
         tuple(window.issues_model.data(window.issues_model.index(row, col)) for col in range(3))
         for row in range(window.issues_model.rowCount())
@@ -226,37 +235,38 @@ def test_issues_show_original_rows_after_empty_and_duplicate_removal(app, window
     assert all(row not in ("2", "4") for row, _, _ in actual)
 
 
-@pytest.mark.parametrize("answer", [QMessageBox.StandardButton.No, QMessageBox.StandardButton.Yes])
-def test_conflicting_export_requires_explicit_yes_each_time(
-    app, window, conflict_csv, tmp_path, monkeypatch, answer
+@pytest.mark.parametrize("reanalyze", [False, True])
+def test_conflicting_export_preserves_variants_without_consent_each_time(
+    app, window, conflict_csv, tmp_path, monkeypatch, reanalyze
 ):
     load(app, window, conflict_csv)
     select(window, 0)
     analyze(app, window)
     before = conflict_csv.read_bytes()
-    prompts = []
 
-    def confirm(*args):
-        prompts.append(args)
-        assert "Конфликтующих групп: 1" in args[2]
-        assert args[-1] == QMessageBox.StandardButton.No
-        return answer
+    def unexpected(*args):
+        pytest.fail("Safe conflict export must not offer a blanket Yes/No deletion confirmation")
 
-    monkeypatch.setattr(QMessageBox, "warning", confirm)
+    monkeypatch.setattr(QMessageBox, "warning", unexpected)
     for index in range(2):
+        if reanalyze:
+            analyze(app, window)
         output = tmp_path / f"out-{index}.csv"
         window.save_cleaned_file(output)
         wait_until(app, lambda: window._worker is None)
-        assert output.exists() == (answer == QMessageBox.StandardButton.Yes)
-        if output.exists():
-            with output.open(encoding="utf-8-sig", newline="") as stream:
-                assert list(csv.reader(stream)) == [
-                    ["ID", "City", "Email"],
-                    ["00123", "Almaty", "a@example.test"],
-                    ["", "Unknown", ""],
-                    ["", "Unknown", ""],
-                ]
-    assert len(prompts) == 2
+        assert output.exists()
+        with output.open(encoding="utf-8-sig", newline="") as stream:
+            assert list(csv.reader(stream)) == [
+                ["ID", "City", "Email"],
+                ["00123", "Almaty", "a@example.test"],
+                ["00123", "Astana", "a@example.test"],
+                ["", "Unknown", ""],
+                ["", "Unknown", ""],
+            ]
+        assert "конфликты не разрешены. Конфликтующих групп: 1." in window.saved_label.text()
+        assert "Конфликты не разрешены" in window.status_label.text()
+        assert "Keep: Row 3" in window.duplicate_details.toPlainText()
+        assert window._job.result.report.removed_duplicates == 1
     assert conflict_csv.read_bytes() == before
     assert window.save_button.isEnabled()
 
@@ -275,36 +285,66 @@ def test_safe_export_has_no_conflict_prompt(app, window, conflict_csv, tmp_path,
     assert output.exists()
 
 
-@pytest.mark.parametrize("dialog", ["confirmation", "destination"])
+def test_export_warning_uses_analyzed_snapshot_if_settings_change_during_export(
+    app, window, conflict_csv, tmp_path
+):
+    started, release = Event(), Event()
+
+    class SlowExport(CleaningService):
+        def export(self, *args, **kwargs):
+            started.set()
+            assert release.wait(6)
+            return super().export(*args, **kwargs)
+
+    window._cleaning_service = SlowExport(FileCleaningStorage())
+    load(app, window, conflict_csv)
+    select(window, 0)
+    analyze(app, window)
+    output = tmp_path / "snapshot.csv"
+    window.save_cleaned_file(output)
+    try:
+        wait_until(app, started.is_set)
+        # Disabled controls can still receive programmatic changes during background work.
+        window.duplicate_mode_combo.setCurrentIndex(0)
+        assert window._job is None
+    finally:
+        release.set()
+        wait_until(app, lambda: window._worker is None)
+    assert "конфликты не разрешены. Конфликтующих групп: 1." in window.saved_label.text()
+    assert not window.save_button.isEnabled()
+    with output.open(encoding="utf-8-sig", newline="") as stream:
+        exported = list(csv.reader(stream))
+    assert exported[1:3] == [
+        ["00123", "Almaty", "a@example.test"],
+        ["00123", "Astana", "a@example.test"],
+    ]
+
+
+@pytest.mark.parametrize("change", ["mode", "keys"])
 def test_dialog_setting_change_cannot_export_stale_job(
-    app, window, conflict_csv, tmp_path, monkeypatch, dialog
+    app, window, conflict_csv, tmp_path, monkeypatch, change
 ):
     load(app, window, conflict_csv)
     select(window, 0)
     analyze(app, window)
     output = tmp_path / "stale.csv"
 
-    def changed_confirmation(*args):
-        select(window, 1)
-        return QMessageBox.StandardButton.Yes
-
     def changed_destination(*args, **kwargs):
-        window.duplicate_mode_combo.setCurrentIndex(0)
+        if change == "mode":
+            window.duplicate_mode_combo.setCurrentIndex(0)
+        else:
+            select(window, 1)
         return str(output), ""
 
-    if dialog == "confirmation":
-        monkeypatch.setattr(QMessageBox, "warning", changed_confirmation)
-        window.save_cleaned_file(output)
-    else:
-        monkeypatch.setattr(QFileDialog, "getSaveFileName", changed_destination)
-        window.save_button.click()
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", changed_destination)
+    window.save_button.click()
     assert window._worker is None
     assert not output.exists()
     assert window._job is None
     assert not window.save_button.isEnabled()
 
 
-def test_bounded_groups_samples_issues_and_full_conflict_confirmation(
+def test_bounded_groups_samples_issues_and_full_conflict_warning(
     app, window, tmp_path, monkeypatch
 ):
     path = tmp_path / "many.csv"
@@ -319,20 +359,45 @@ def test_bounded_groups_samples_issues_and_full_conflict_confirmation(
     analyze(app, window)
     details = window.duplicate_details.toPlainText()
     assert "Showing first 100 of 105 duplicate groups." in details
-    assert "Showing first 20 of 25 removed rows." in details
+    assert "Showing first 20 of 24 removed rows." in details
     assert "Conflicting Groups: 105" in details
     assert window.issues_model.rowCount() == 100
     assert "Showing first 100 of 110 issues." in window.issues_label.text()
     assert "Duplicate Group 101\n" not in details
-    prompts = []
 
-    def confirm(*args):
-        prompts.append(args[2])
-        return QMessageBox.StandardButton.No
+    def unexpected(*args):
+        pytest.fail("Unresolved conflicts are retained without a deletion confirmation")
 
-    monkeypatch.setattr(QMessageBox, "warning", confirm)
-    window.save_cleaned_file(tmp_path / "declined.csv")
-    assert "Конфликтующих групп: 105" in prompts[0]
+    monkeypatch.setattr(QMessageBox, "warning", unexpected)
+    output = tmp_path / "preserved.csv"
+    window.save_cleaned_file(output)
+    wait_until(app, lambda: window._worker is None)
+    assert output.exists()
+    assert "конфликты не разрешены. Конфликтующих групп: 105." in window.saved_label.text()
+    with output.open(encoding="utf-8-sig", newline="") as stream:
+        assert len(list(csv.reader(stream))) == 321
+
+
+def test_retained_conflict_samples_are_bounded_without_dropping_export_rows(app, window, tmp_path):
+    path = tmp_path / "variants.csv"
+    rows = [["ID", "City"], *[["001", f"City {index}"] for index in range(26)]]
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        csv.writer(stream).writerows(rows)
+    load(app, window, path)
+    select(window, 0)
+    analyze(app, window)
+    details = window.duplicate_details.toPlainText()
+    assert "Status: Conflict — Needs Review" in details
+    assert "Showing first 21 of 26 retained rows." in details
+    assert "Automatically Removed Identical Rows: 0." in details
+    assert "Keep: Row 22 |" in details
+    assert "Keep: Row 23 |" not in details
+    assert window._job.result.source_rows == tuple(range(1, 28))
+    output = tmp_path / "all-variants.csv"
+    window.save_cleaned_file(output)
+    wait_until(app, lambda: window._worker is None)
+    with output.open(encoding="utf-8-sig", newline="") as stream:
+        assert list(csv.reader(stream)) == rows
 
 
 def test_full_width_column_selection_uses_model_not_individual_widgets(app, window, tmp_path):

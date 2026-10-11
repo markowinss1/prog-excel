@@ -22,6 +22,8 @@ class _DuplicateDetail:
     removed_source_rows: list[int] = field(default_factory=list)
     removed_values: list[tuple[Cell, ...]] = field(default_factory=list)
     conflicting_columns: set[int] = field(default_factory=set)
+    retained_source_rows: list[int] = field(default_factory=list)
+    retained_values: list[tuple[Cell, ...]] = field(default_factory=list)
 
 
 @dataclass
@@ -29,6 +31,9 @@ class _SeenRow:
     source_row: int
     values: tuple[Cell, ...]
     removed_count: int = 0
+    row_count: int = 1
+    retained_count: int = 1
+    variants: set[tuple] | None = None  # Only Selected Columns needs full-row variants.
     has_conflict: bool = False
     detail: _DuplicateDetail | None = None
 
@@ -54,8 +59,9 @@ def clean(table: Table, plan: CleaningPlan | None = None) -> CleaningResult:
 
     Formulas are explicit Cell(..., data_type="f"). Row deletion is rejected if
     formulas exist; file adapters additionally check the other workbook sheets.
-    Selected keys with missing fields are retained for review. Detailed duplicate
-    groups and issues are bounded; aggregate counts always cover the full table.
+    Selected keys with missing fields and distinct records sharing a key are
+    retained for review. Only identical normalized records are removed. Detailed
+    duplicate groups and issues are bounded; aggregate counts cover the full table.
     """
     if not isinstance(table, Table):
         raise CleaningError("Очистка требует полную Table; Preview не поддерживается.")
@@ -113,23 +119,44 @@ def clean(table: Table, plan: CleaningPlan | None = None) -> CleaningResult:
                 missing_keys += 1
             else:
                 key = tuple(_key(_cell(row, column)) for column in compared_columns)
+                full_key = (
+                    tuple(_key(_cell(row, column)) for column in range(width))
+                    if selected_keys
+                    else key
+                )
                 first = seen.get(key)
                 if first is None:
-                    seen[key] = _SeenRow(index, row)
+                    seen[key] = _SeenRow(index, row, variants={full_key} if selected_keys else None)
                 else:
-                    duplicates += 1
-                    if first.removed_count == 0:
+                    if first.row_count == 1:
                         group_count += 1
                         if len(detailed_groups) < plan.duplicate_detail_limit:
-                            first.detail = _DuplicateDetail()
+                            first.detail = _DuplicateDetail(
+                                retained_source_rows=[first.source_row],
+                                retained_values=[first.values],
+                            )
                             detailed_groups.append(first)
-                    first.removed_count += 1
+                    first.row_count += 1
                     detail = first.detail
-                    if detail is not None:
-                        if len(detail.removed_source_rows) < plan.duplicate_row_detail_limit:
+                    if first.variants is None or full_key in first.variants:
+                        duplicates += 1
+                        first.removed_count += 1
+                        if (
+                            detail is not None
+                            and len(detail.removed_source_rows) < plan.duplicate_row_detail_limit
+                        ):
                             detail.removed_source_rows.append(index)
                             detail.removed_values.append(row)
-                    # Examine every removed row, including those beyond display limits.
+                        continue
+                    first.variants.add(full_key)
+                    first.retained_count += 1
+                    if (
+                        detail is not None
+                        and len(detail.retained_source_rows) <= plan.duplicate_row_detail_limit
+                    ):
+                        detail.retained_source_rows.append(index)
+                        detail.retained_values.append(row)
+                    # Examine every distinct retained row, including unsampled rows.
                     if detail is not None or not first.has_conflict:
                         was_conflicting = first.has_conflict
                         for column in other_columns:
@@ -141,7 +168,6 @@ def clean(table: Table, plan: CleaningPlan | None = None) -> CleaningResult:
                                     break
                         if first.has_conflict and not was_conflicting:
                             conflicts += 1
-                    continue
         output.append(row)
         source_rows.append(index)
     if has_formulas and (empty or duplicates):
@@ -173,10 +199,12 @@ def clean(table: Table, plan: CleaningPlan | None = None) -> CleaningResult:
                         )
     groups = []
     row_samples_truncated = False
+    retained_samples_truncated = False
     for first in detailed_groups:
         detail = first.detail
         assert detail is not None
         row_samples_truncated |= first.removed_count > len(detail.removed_source_rows)
+        retained_samples_truncated |= first.retained_count > len(detail.retained_source_rows)
         groups.append(
             DuplicateGroup(
                 key=tuple(_cell(first.values, column) for column in compared_columns),
@@ -186,6 +214,9 @@ def clean(table: Table, plan: CleaningPlan | None = None) -> CleaningResult:
                 removed_values=tuple(detail.removed_values),
                 removed_count=first.removed_count,
                 conflicting_columns=tuple(sorted(detail.conflicting_columns)),
+                retained_source_rows=tuple(detail.retained_source_rows),
+                retained_values=tuple(detail.retained_values),
+                retained_count=first.retained_count,
             )
         )
     truncated = missing > len(details)
@@ -194,7 +225,8 @@ def clean(table: Table, plan: CleaningPlan | None = None) -> CleaningResult:
     if conflicts:
         warnings.append(
             f"Конфликтующие группы дубликатов: {conflicts}. Значения вне ключевых столбцов "
-            "различаются; сохранена первая строка. Экспорт требует подтверждения."
+            "различаются; все отличающиеся записи сохранены для ручной проверки. "
+            "Конфликты не разрешены; безопасный результат можно экспортировать в новый файл."
         )
     if missing_keys:
         warnings.append(f"Строки с отсутствующими ключами сохранены для проверки: {missing_keys}.")
@@ -202,6 +234,8 @@ def clean(table: Table, plan: CleaningPlan | None = None) -> CleaningResult:
         warnings.append(f"Показаны первые {len(groups)} из {group_count} групп дубликатов.")
     if row_samples_truncated:
         warnings.append("Примеры удаляемых строк усечены; общее количество указано полностью.")
+    if retained_samples_truncated:
+        warnings.append("Примеры сохранённых строк усечены; общее количество указано полностью.")
     if truncated:
         warnings.append("Список пропусков усечён; общее количество указано полностью.")
     if issues_truncated:

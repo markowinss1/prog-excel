@@ -38,7 +38,9 @@ def test_duplicates_are_stable_case_and_type_sensitive():
 def test_duplicate_selected_columns_and_ragged_rows():
     source = table(["id", "name"], ["001", "one"], ["001", "two"], ["002"])
     result = clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(0,)))
-    assert values(result) == [["id", "name"], ["001", "one"], ["002"]]
+    assert values(result) == [["id", "name"], ["001", "one"], ["001", "two"], ["002"]]
+    assert result.report.removed_duplicates == 0
+    assert result.report.conflicting_duplicate_groups == 1
     assert clean(source, CleaningPlan(remove_duplicates=True)).report.removed_duplicates == 0
     with pytest.raises(CleaningError, match="пределы"):
         clean(source, CleaningPlan(remove_duplicates=True, duplicate_columns=(2,)))

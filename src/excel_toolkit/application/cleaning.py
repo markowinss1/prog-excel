@@ -1,0 +1,68 @@
+"""File cleaning workflow, independent of Qt and of a concrete storage adapter."""
+
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Protocol
+
+from excel_toolkit.application.models import CsvOptions
+from excel_toolkit.modules.cleaner import CleaningPlan, CleaningResult, Table, clean
+
+
+@dataclass(frozen=True)
+class CleaningSource:
+    path: Path
+    table: Table
+    sheet_names: tuple[str, ...] = ()
+    selected_sheet: str | None = None
+    csv_options: CsvOptions | None = None
+    # Immutable source snapshot: export never reopens a potentially changed original.
+    xlsx_snapshot: bytes | None = field(default=None, repr=False)
+    sheet_part: str | None = None
+    contains_formulas: bool = False
+
+
+@dataclass(frozen=True)
+class CleaningJob:
+    source: CleaningSource
+    result: CleaningResult
+
+
+class CleaningStorage(Protocol):
+    def read(self, path: Path, sheet: str | None, options: CsvOptions) -> CleaningSource: ...
+
+    def validate(self, source: CleaningSource, result: CleaningResult) -> None: ...
+
+    def write(self, job: CleaningJob, destination: Path) -> None: ...
+
+
+class CleaningService:
+    def __init__(self, storage: CleaningStorage) -> None:
+        self._storage = storage
+
+    def analyze(
+        self,
+        path: str | Path,
+        plan: CleaningPlan,
+        *,
+        sheet: str | None = None,
+        csv_options: CsvOptions | None = None,
+    ) -> CleaningJob:
+        source = self._storage.read(Path(path), sheet, csv_options or CsvOptions())
+        result = clean(source.table, plan)
+        self._storage.validate(source, result)
+        if source.contains_formulas:
+            result = replace(
+                result,
+                report=replace(
+                    result.report,
+                    warnings=result.report.warnings
+                    + (
+                        "Формулы и их кэш сохранены без вычисления. После изменения текста "
+                        "зависимые результаты могут требовать пересчёта в Excel.",
+                    ),
+                ),
+            )
+        return CleaningJob(source, result)
+
+    def export(self, job: CleaningJob, destination: str | Path) -> None:
+        self._storage.write(job, Path(destination))

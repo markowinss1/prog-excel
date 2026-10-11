@@ -30,6 +30,29 @@ def main() -> None:
                 workbook.save(stream)
         finally:
             workbook.close()
+    dirty_rows = [
+        ["ID", "Имя"],
+        [" 001234 ", " Анна "],
+        ["001234", "Анна"],
+        [" ", ""],
+        ["000007", ""],
+    ]
+    path = directory / "cleaner_demo.csv"
+    if not path.exists():
+        with path.open("x", encoding="utf-8-sig", newline="") as stream:
+            csv.writer(stream, delimiter=";").writerows(dirty_rows)
+    path = directory / "cleaner_demo.xlsx"
+    if not path.exists():
+        workbook = Workbook()
+        workbook.active.title = "Клиенты"
+        for row in dirty_rows:
+            workbook.active.append(row)
+        workbook.create_sheet("Справочник").append([" Не изменять ", "000042"])
+        try:
+            with path.open("xb") as stream:
+                workbook.save(stream)
+        finally:
+            workbook.close()
     print(f"Примеры: {directory}")
 
 

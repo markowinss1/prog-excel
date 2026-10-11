@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Protocol
 
-from excel_toolkit.application.models import CsvOptions
+from excel_toolkit.application.models import COLUMN_LIMIT, ROW_LIMIT, CsvOptions, Preview
 from excel_toolkit.modules.cleaner import CleaningPlan, CleaningResult, Table, clean
 
 
@@ -25,6 +25,21 @@ class CleaningSource:
 class CleaningJob:
     source: CleaningSource
     result: CleaningResult
+
+    def previews(self) -> tuple[Preview, Preview]:
+        """Bounded views of the exact analyzed snapshot, never inputs to export."""
+        return tuple(
+            Preview(
+                path=self.source.path,
+                rows=tuple(row[:COLUMN_LIMIT] for row in table.rows[:ROW_LIMIT]),
+                sheet_names=self.source.sheet_names,
+                selected_sheet=self.source.selected_sheet,
+                more_rows=len(table.rows) > ROW_LIMIT,
+                more_columns=any(len(row) > COLUMN_LIMIT for row in table.rows),
+                csv_options=self.source.csv_options,
+            )
+            for table in (self.source.table, self.result.table)
+        )
 
 
 class CleaningStorage(Protocol):
